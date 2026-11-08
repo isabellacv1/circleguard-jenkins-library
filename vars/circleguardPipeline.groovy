@@ -107,6 +107,9 @@ def call(Map rawConfig = [:]) {
             }
             failure {
                 echo 'Pipeline failed. Check the failed stage and the Tests tab for details.'
+                if (cfg.discordCredentialsId) {
+                    notifyDiscord(credentialsId: cfg.discordCredentialsId, status: 'FAILURE')
+                }
             }
         }
     }
