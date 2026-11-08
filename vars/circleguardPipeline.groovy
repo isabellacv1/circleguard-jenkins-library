@@ -74,6 +74,28 @@ def call(Map rawConfig = [:]) {
                     sonarAnalysis(server: cfg.sonarServer, projectKey: cfg.sonarProjectKey)
                 }
             }
+
+            stage('Publish images') {
+                when {
+                    expression { cfg.publish && cfg.publishBranches.contains(env.BRANCH_NAME) }
+                }
+                options {
+                    timeout(time: cfg.publishTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        String version = resolveVersion()
+                        echo "Image version: ${version}"
+                        currentBuild.description = "images ${version}"
+                        publishImages(
+                            registry: cfg.registry,
+                            credentialsId: cfg.registryCredentialsId,
+                            version: version,
+                            images: cfg.images
+                        )
+                    }
+                }
+            }
         }
 
         post {

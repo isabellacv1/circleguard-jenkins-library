@@ -12,6 +12,8 @@ vars/gradlew.groovy                            runs ./gradlew tasks
 vars/configureTestcontainers.groovy            Testcontainers networking inside Jenkins
 vars/publishTestReports.groovy                 JUnit results + test/JaCoCo reports
 vars/sonarAnalysis.groovy                      SonarQube analysis + quality gate (optional)
+vars/resolveVersion.groovy                     semantic version for the images (from release tags)
+vars/publishImages.groovy                      docker build + push to the Nexus registry
 ```
 
 ## Usage
@@ -39,6 +41,12 @@ circleguardPipeline(
 | `testTimeout` | `45` | Tests stage timeout (minutes). |
 | `integrationTimeout` | `30` | Integration tests stage timeout (minutes). |
 | `buildsToKeep` | `20` | Number of builds kept by Jenkins. |
+| `publish` | `false` | Builds and pushes the Docker images to the registry. |
+| `publishBranches` | `['dev', 'main']` | Branches that publish images (PRs never publish). |
+| `registry` | `localhost:8082` | Docker registry (Nexus `docker-hosted` HTTP connector). |
+| `registryCredentialsId` | `nexus-credential` | Jenkins credential with push access to the registry. |
+| `images` | 5 core services + web | List of `[name, dockerfile, context]` to build. |
+| `publishTimeout` | `40` | Publish stage timeout (minutes). |
 
 ### Stages
 
@@ -49,6 +57,22 @@ circleguardPipeline(
 | Tests | `./gradlew test --continue` |
 | Integration tests | `./gradlew integrationTest --continue` (if `integrationTests`) |
 | SonarQube | analysis + quality gate (if `sonar`) |
+| Publish images | `docker build` + `docker push` of every image (if `publish` and branch in `publishBranches`) |
+
+### Image versions
+
+Images are tagged only with a semantic version, never `latest`:
+
+- If the commit has a release tag created by semantic-release (`v1.2.0`, `v1.3.0-dev.2`), that version
+  is used: `circleguard/auth-service:1.2.0`.
+- Otherwise a pre-release version is built from the last release tag:
+  `circleguard/auth-service:1.2.0-build.15.ab12cd3`.
+
+The list of pushed images is archived in every build as `published-images.txt`.
+
+The registry must have an HTTP connector (Nexus `docker-hosted`, port 8082) and the
+"Docker Bearer Token Realm" enabled. Jenkins pushes to `localhost:8082` because Nexus runs on the
+same host; machines that pull from `<host>:8082` need it in `insecure-registries` while it has no TLS.
 
 Test results and reports are published after every run, even if a stage fails.
 
