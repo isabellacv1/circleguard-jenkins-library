@@ -14,6 +14,7 @@ vars/publishTestReports.groovy                 JUnit results + test/JaCoCo repor
 vars/sonarAnalysis.groovy                      SonarQube analysis + quality gate (optional)
 vars/resolveVersion.groovy                     semantic version for the images (from release tags)
 vars/publishImages.groovy                      docker build + push to the Nexus registry
+vars/notifyDiscord.groovy                      Discord notification of the build result
 ```
 
 ## Usage
@@ -47,6 +48,7 @@ circleguardPipeline(
 | `registryCredentialsId` | `nexus-credential` | Jenkins credential with push access to the registry. |
 | `images` | 5 core services + web | List of `[name, dockerfile, context]` to build. |
 | `publishTimeout` | `40` | Publish stage timeout (minutes). |
+| `discordCredentialsId` | `discord-webhook-url` | Jenkins Secret text credential with the Discord webhook URL. Empty disables it. |
 
 ### Stages
 
@@ -75,6 +77,12 @@ The registry must have an HTTP connector (Nexus `docker-hosted`, port 8082) and 
 same host; machines that pull from `<host>:8082` need it in `insecure-registries` while it has no TLS.
 
 Test results and reports are published after every run, even if a stage fails.
+
+When a build fails, the library sends a Discord message with the job, build number, branch, commit
+and build URL. The webhook URL is stored in Jenkins as a **Secret text** credential with id
+`discord-webhook-url` (override it with `discordCredentialsId`). The step uses `curl`, so no extra
+plugin is required. If the credential or the webhook fails, the notification is skipped and the
+pipeline result is not changed.
 
 The steps in `vars/` can also be used on their own from any Jenkinsfile that loads the library,
 for example `gradlew 'build'` or `publishTestReports()`.

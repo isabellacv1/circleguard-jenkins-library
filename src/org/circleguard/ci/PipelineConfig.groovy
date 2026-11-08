@@ -29,6 +29,8 @@ class PipelineConfig implements Serializable {
     int publishTimeout = 40
     int buildsToKeep = 20
 
+    String discordCredentialsId = 'discord-webhook-url'
+
     PipelineConfig(Map config) {
         Map c = config ?: [:]
         this.integrationTests = c.integrationTests != null ? c.integrationTests as boolean : this.integrationTests
@@ -45,5 +47,6 @@ class PipelineConfig implements Serializable {
         this.integrationTimeout = c.integrationTimeout ? c.integrationTimeout as int : this.integrationTimeout
         this.publishTimeout = c.publishTimeout ? c.publishTimeout as int : this.publishTimeout
         this.buildsToKeep = c.buildsToKeep ? c.buildsToKeep as int : this.buildsToKeep
+        this.discordCredentialsId = c.discordCredentialsId != null ? c.discordCredentialsId : this.discordCredentialsId
     }
 }
