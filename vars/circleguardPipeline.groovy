@@ -160,15 +160,19 @@ def call(Map rawConfig = [:]) {
                     timeout(time: cfg.e2eTimeout, unit: 'MINUTES')
                 }
                 steps {
-                    String base = "http://${env.DEPLOY_HOST}"
-                    runE2E(
-                        baseUrl: "${base}:8081",
-                        authBaseUrl: "${base}:8180",
-                        gatewayBaseUrl: "${base}:8087",
-                        credentialsId: cfg.e2eCredentialsId,
-                        image: cfg.e2eImage,
-                        timeoutMinutes: cfg.e2eTimeout
-                    )
+                    // A declarative steps{} block only accepts steps, so the
+                    // variables must live inside a script{} block.
+                    script {
+                        String base = "http://${env.DEPLOY_HOST}"
+                        runE2E(
+                            baseUrl: "${base}:8081",
+                            authBaseUrl: "${base}:8180",
+                            gatewayBaseUrl: "${base}:8087",
+                            credentialsId: cfg.e2eCredentialsId,
+                            image: cfg.e2eImage,
+                            timeoutMinutes: cfg.e2eTimeout
+                        )
+                    }
                 }
             }
 
