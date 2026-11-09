@@ -258,6 +258,11 @@ def call(Map rawConfig = [:]) {
                     if (cfg.dockerCleanup) {
                         dockerCleanup()
                     }
+                    // PR and feature branch workspaces are not reused, delete them to save disk.
+                    // dev and main keep theirs so the next build is faster.
+                    if (!(env.BRANCH_NAME in ['dev', 'main'])) {
+                        deleteDir()
+                    }
                 }
             }
             success {

@@ -173,3 +173,6 @@ The same checks run after every promotion (stage, prod).
 It removes BuildKit cache above 2 GB, dangling images, stopped containers and unused anonymous volumes
 left by Testcontainers. It never touches running containers, images in use or named volumes, and it
 never fails the build. The disk before and after is printed in the log.
+
+At the end of PR and feature branch builds the workspace is deleted (`deleteDir()`); `dev` and `main` keep
+theirs so the next build is faster.
