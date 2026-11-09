@@ -14,6 +14,7 @@ vars/publishTestReports.groovy                 JUnit results + test/JaCoCo repor
 vars/sonarAnalysis.groovy                      SonarQube analysis + quality gate (optional)
 vars/resolveVersion.groovy                     semantic version for the images (from release tags)
 vars/publishImages.groovy                      docker build + push to the Nexus registry
+vars/ensureBuildx.groovy                       installs the Docker buildx plugin if missing (BuildKit)
 vars/notifyDiscord.groovy                      Discord notification of the build result
 ```
 
@@ -82,6 +83,10 @@ Images are tagged only with a semantic version, never `latest`:
   `circleguard/auth-service:1.2.0-build.15.ab12cd3`.
 
 The list of pushed images is archived in every build as `published-images.txt`.
+
+The Dockerfiles use `RUN --mount=type=cache`, which needs BuildKit. `publishImages` calls
+`ensureBuildx()`, which downloads a pinned buildx release (checksum verified) into
+`~/.docker/cli-plugins` when the Jenkins image does not include it.
 
 The registry must have an HTTP connector (Nexus `docker-hosted`, port 8082) and the
 "Docker Bearer Token Realm" enabled. Jenkins pushes to `localhost:8082` because Nexus runs on the
