@@ -27,6 +27,9 @@ def call(Map params = [:]) {
 
     List<String> pushed = []
 
+    // The Dockerfiles use RUN --mount=type=cache, which needs BuildKit (buildx)
+    ensureBuildx()
+
     withCredentials([usernamePassword(credentialsId: credentialsId,
                                       usernameVariable: 'REGISTRY_USER',
                                       passwordVariable: 'REGISTRY_PASS')]) {
