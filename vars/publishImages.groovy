@@ -29,6 +29,8 @@ def call(Map params = [:]) {
 
     // The Dockerfiles use RUN --mount=type=cache, which needs BuildKit (buildx)
     ensureBuildx()
+    // Make room before building: the Jenkins host disk is small
+    dockerCleanup()
 
     withCredentials([usernamePassword(credentialsId: credentialsId,
                                       usernameVariable: 'REGISTRY_USER',

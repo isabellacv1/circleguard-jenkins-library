@@ -166,3 +166,10 @@ The same checks run after every promotion (stage, prod).
 | `smokeTests` | `true` | Runs the smoke tests after the deployment and after each promotion. |
 | `smokeCredentialsId` | `e2e-credential` | Username/password credential for the login check (`null` skips the login checks). |
 | `smokeTimeout` | `10` | Smoke tests stage timeout (minutes). |
+
+## Disk cleanup on the Jenkins host
+
+`dockerCleanup()` runs before building the images and at the end of every build (`dockerCleanup: true`).
+It removes BuildKit cache above 2 GB, dangling images, stopped containers and unused anonymous volumes
+left by Testcontainers. It never touches running containers, images in use or named volumes, and it
+never fails the build. The disk before and after is printed in the log.
