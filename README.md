@@ -49,6 +49,15 @@ circleguardPipeline(
 | `images` | 5 core services + web | List of `[name, dockerfile, context]` to build. |
 | `publishTimeout` | `40` | Publish stage timeout (minutes). |
 | `discordCredentialsId` | `discord-webhook-url` | Jenkins Secret text credential with the Discord webhook URL. Empty disables it. |
+| `deploy` | `false` | Deploys the published images to an AWS environment (requires `publish: true`). |
+| `environment` | `dev` | Target environment: `dev`, `stage` or `prod`. Read from `deploy/environments/<env>.env`. |
+| `deployBranches` | `['dev']` | Branches that run the deploy and verification stages. |
+| `deployCredentialId` | `${environment}-credential` | SSH credential (`dev-credential`, `stage-credential`, `prod-credential`). |
+| `deployTimeout` | `20` | Deploy stage timeout (minutes). |
+| `verifyTimeout` | `15` | Verification stage timeout (minutes). |
+| `healthRetries` | `20` | Attempts per service before the deployment is rejected. |
+| `healthIntervalSeconds` | `10` | Seconds between attempts. |
+| `services` | gateway/auth/identity/form/promotion/web | Components checked after the deployment (`name`, `port`, `path`). |
 
 ### Stages
 
@@ -60,6 +69,8 @@ circleguardPipeline(
 | Integration tests | `./gradlew integrationTest --continue` (if `integrationTests`) |
 | SonarQube | analysis + quality gate (if `sonar`) |
 | Publish images | `docker build` + `docker push` of every image (if `publish` and branch in `publishBranches`) |
+| Deploy | Copies the compose files to the target host over SSH and runs `docker compose up -d --wait` with the published images (if `deploy` and branch in `deployBranches`) |
+| Verify deployment | HTTP check of every component with retries; the build fails if a service does not answer (if `deploy`) |
 
 ### Image versions
 

@@ -10,6 +10,12 @@ import org.circleguard.ci.PipelineConfig
 def call(Map rawConfig = [:]) {
     PipelineConfig cfg = new PipelineConfig(rawConfig)
 
+    // The deployment runs the images produced by this build, so publishing them
+    // first is mandatory: fail early with a clear message instead of failing at pull.
+    if (cfg.deploy && !cfg.publish) {
+        error 'circleguardPipeline: deploy requires publish=true (the deployment pulls the images published by this build)'
+    }
+
     pipeline {
         agent any
 
@@ -87,6 +93,9 @@ def call(Map rawConfig = [:]) {
                     script {
                         String version = resolveVersion()
                         echo "Image version: ${version}"
+                        // The deploy stages reuse exactly this version, so the
+                        // environment always runs the images this build produced.
+                        env.IMAGE_VERSION = version
                         currentBuild.description = "images ${version}"
                         publishImages(
                             registry: cfg.registry,
@@ -95,6 +104,49 @@ def call(Map rawConfig = [:]) {
                             images: cfg.images
                         )
                     }
+                }
+            }
+
+            // HU-13: deploy of the published images to an AWS environment.
+            stage('Deploy') {
+                when {
+                    expression { cfg.deploy && cfg.deployBranches.contains(env.BRANCH_NAME) }
+                }
+                options {
+                    timeout(time: cfg.deployTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        // The same version that was published (never "latest").
+                        String version = env.IMAGE_VERSION ?: resolveVersion()
+                        env.IMAGE_VERSION = version
+                        String credentialId = cfg.deployCredentialId ?: "${cfg.environment}-credential"
+                        Map envCfg = deployEnvironment(
+                            environment: cfg.environment,
+                            version: version,
+                            credentialId: credentialId
+                        )
+                        env.DEPLOY_HOST = envCfg.HOST
+                        currentBuild.description = "images ${version} -> ${cfg.environment}"
+                    }
+                }
+            }
+
+            // HU-13: the deployment is only accepted if every component answers.
+            stage('Verify deployment') {
+                when {
+                    expression { cfg.deploy && cfg.deployBranches.contains(env.BRANCH_NAME) }
+                }
+                options {
+                    timeout(time: cfg.verifyTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    verifyServices(
+                        host: env.DEPLOY_HOST,
+                        services: cfg.services,
+                        retries: cfg.healthRetries,
+                        intervalSeconds: cfg.healthIntervalSeconds
+                    )
                 }
             }
         }

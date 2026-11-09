@@ -23,6 +23,25 @@ class PipelineConfig implements Serializable {
         [name: 'circleguard/web',               dockerfile: 'mobile/Dockerfile',                                 context: 'mobile'],
     ]
 
+    // Deployment to AWS (HU-13). The environment files live in deploy/environments/.
+    boolean deploy = false
+    String environment = 'dev'
+    List<String> deployBranches = ['dev']
+    String deployCredentialId = null     // defaults to "${environment}-credential"
+    int deployTimeout = 20
+    int verifyTimeout = 15
+    int healthRetries = 20
+    int healthIntervalSeconds = 10
+    // Components of "Parte 1" and how to check that they are available.
+    List<Map> services = [
+        [name: 'gateway',   port: 8087],
+        [name: 'auth',      port: 8180],
+        [name: 'identity',  port: 8083],
+        [name: 'form',      port: 8086],
+        [name: 'promotion', port: 8088],
+        [name: 'web',       port: 8081, path: '/'],
+    ]
+
     int buildTimeout = 30
     int testTimeout = 45
     int integrationTimeout = 30
@@ -42,6 +61,15 @@ class PipelineConfig implements Serializable {
         this.registryCredentialsId = c.registryCredentialsId ?: this.registryCredentialsId
         this.publishBranches = c.publishBranches ?: this.publishBranches
         this.images = c.images ?: this.images
+        this.deploy = c.deploy != null ? c.deploy as boolean : this.deploy
+        this.environment = c.environment ?: this.environment
+        this.deployBranches = c.deployBranches ?: this.deployBranches
+        this.deployCredentialId = c.deployCredentialId ?: this.deployCredentialId
+        this.deployTimeout = c.deployTimeout ? c.deployTimeout as int : this.deployTimeout
+        this.verifyTimeout = c.verifyTimeout ? c.verifyTimeout as int : this.verifyTimeout
+        this.healthRetries = c.healthRetries ? c.healthRetries as int : this.healthRetries
+        this.healthIntervalSeconds = c.healthIntervalSeconds ? c.healthIntervalSeconds as int : this.healthIntervalSeconds
+        this.services = c.services ?: this.services
         this.buildTimeout = c.buildTimeout ? c.buildTimeout as int : this.buildTimeout
         this.testTimeout = c.testTimeout ? c.testTimeout as int : this.testTimeout
         this.integrationTimeout = c.integrationTimeout ? c.integrationTimeout as int : this.integrationTimeout
