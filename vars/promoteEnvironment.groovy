@@ -78,6 +78,16 @@ def call(Map params = [:]) {
         intervalSeconds: interval
     )
 
+    // HU-15: the promoted environment must also pass the smoke tests
+    if (params.smokeTests != false) {
+        smokeTests(
+            host: envCfg.HOST,
+            environment: to,
+            sshCredentialId: credentialId,
+            loginCredentialsId: params.containsKey('smokeCredentialsId') ? params.smokeCredentialsId : 'e2e-credential'
+        )
+    }
+
     // Evidence of the promotion, archived with this build.
     String record = """CircleGuard promotion record
 =============================
