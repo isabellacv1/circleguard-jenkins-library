@@ -40,28 +40,34 @@ def call(Map params = [:]) {
 
     echo "E2E against ${baseUrl} using ${image}"
 
-    withCredentials([usernamePassword(credentialsId: credentialsId,
-                                      usernameVariable: 'E2E_USERNAME',
-                                      passwordVariable: 'E2E_PASSWORD')]) {
-        timeout(time: timeoutMinutes, unit: 'MINUTES') {
-            // The same uid as the workspace owner, so the reports are not
-            // written as root and the next checkout can clean them up.
-            sh """docker run --rm \
-                --user "\$(id -u):\$(id -g)" \
-                -e HOME=/tmp \
-                -v ${volume}:/jh \
-                -w ${hostWorkspace}/tests/e2e-playwright \
-                -e BASE_URL='${baseUrl}' \
-                -e AUTH_BASE_URL='${authBaseUrl}' \
-                -e GATEWAY_BASE_URL='${gatewayBaseUrl}' \
-                -e E2E_USERNAME \
-                -e E2E_PASSWORD \
-                -e CI=true \
-                ${image} \
-                bash -c 'npm ci && npx playwright test'"""
+    // The reports are published even when the tests fail (sh throws on a non-zero exit),
+    // so the failure can be analysed from the build: JUnit, HTML report, screenshots,
+    // videos and traces.
+    try {
+        withCredentials([usernamePassword(credentialsId: credentialsId,
+                                          usernameVariable: 'E2E_USERNAME',
+                                          passwordVariable: 'E2E_PASSWORD')]) {
+            timeout(time: timeoutMinutes, unit: 'MINUTES') {
+                // The same uid as the workspace owner, so the reports are not
+                // written as root and the next checkout can clean them up.
+                sh """docker run --rm \
+                    --user "\$(id -u):\$(id -g)" \
+                    -e HOME=/tmp \
+                    -v ${volume}:/jh \
+                    -w ${hostWorkspace}/tests/e2e-playwright \
+                    -e BASE_URL='${baseUrl}' \
+                    -e AUTH_BASE_URL='${authBaseUrl}' \
+                    -e GATEWAY_BASE_URL='${gatewayBaseUrl}' \
+                    -e E2E_USERNAME \
+                    -e E2E_PASSWORD \
+                    -e CI=true \
+                    ${image} \
+                    bash -c 'npm ci && npx playwright test'"""
+            }
         }
+    } finally {
+        junit testResults: 'tests/e2e-playwright/results.xml', allowEmptyResults: true
+        archiveArtifacts artifacts: 'tests/e2e-playwright/playwright-report/**, tests/e2e-playwright/test-results/**',
+                         allowEmptyArchive: true
     }
-
-    junit testResults: 'tests/e2e-playwright/results.xml', allowEmptyResults: false
-    archiveArtifacts artifacts: 'tests/e2e-playwright/playwright-report/**', allowEmptyArchive: true
 }
