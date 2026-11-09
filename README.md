@@ -61,8 +61,8 @@ circleguardPipeline(
 | `services` | gateway/auth/identity/form/promotion/web | Components checked after the deployment (`name`, `port`, `path`). |
 | `e2e` | `true` | Runs the Playwright end to end tests against the deployed `dev`. |
 | `e2eTimeout` | `20` | E2E stage timeout (minutes). |
-| `e2eCredentialsId` | `e2e-credentials` | Username/password of a test user of the application. |
-| `e2eImage` | `mcr.microsoft/playwright:v1.65.0` | Image used to run the tests (Jenkins has no Node.js). |
+| `e2eCredentialsId` | `e2e-credential` | Username/password of a test user of the application. |
+| `e2eImage` | `mcr.microsoft.com/playwright:v1.65.0-noble` | Image used to run the tests (Jenkins has no Node.js). |
 | `promote` | `false` | Enables the promotion stages `dev -> stage -> prod`. |
 | `stageApproval` | `false` | `false` promotes to stage automatically after the E2E tests. |
 | `prodApproval` | `true` | `true` waits for a manual approval (`input`) before promoting to prod. |

@@ -50,8 +50,8 @@ class PipelineConfig implements Serializable {
     // Version promotion between environments (HU-14).
     boolean e2e = true                       // Playwright tests against the deployed dev
     int e2eTimeout = 20
-    String e2eCredentialsId = 'e2e-credentials'
-    String e2eImage = 'mcr.microsoft/playwright:v1.65.0'
+    String e2eCredentialsId = 'e2e-credential'
+    String e2eImage = 'mcr.microsoft.com/playwright:v1.65.0-noble'
     boolean promote = false                  // dev -> stage -> prod
     boolean stageApproval = false            // stage is promoted automatically after E2E
     boolean prodApproval = true              // prod always waits for a manual input

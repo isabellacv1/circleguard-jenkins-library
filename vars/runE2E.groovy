@@ -10,7 +10,7 @@
  * The reports (JUnit XML and the HTML report) are written back into the
  * workspace through the volume, so they can be published with the usual steps.
  *
- * Credentials: `e2e-credentials` (username/password of a test user of the app).
+ * Credentials: `e2e-credential` (username/password of a test user of the app).
  *
  * Usage:
  *   runE2E(
@@ -23,8 +23,8 @@ def call(Map params = [:]) {
     String baseUrl = params.baseUrl
     String authBaseUrl = params.authBaseUrl ?: baseUrl
     String gatewayBaseUrl = params.gatewayBaseUrl ?: baseUrl
-    String credentialsId = params.credentialsId ?: 'e2e-credentials'
-    String image = params.image ?: 'mcr.microsoft/playwright:v1.65.0'
+    String credentialsId = params.credentialsId ?: 'e2e-credential'
+    String image = params.image ?: 'mcr.microsoft.com/playwright:v1.65.0-noble'
     int timeoutMinutes = params.timeoutMinutes ?: 20
     String volume = params.volume ?: 'circleguard-jenkins-home'
 
