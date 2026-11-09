@@ -47,14 +47,17 @@ def call(Map params = [:]) {
                                        keyFileVariable: 'SMOKE_SSH_KEY')]) {
         sh 'chmod 600 "$SMOKE_SSH_KEY"'
         if (loginCredentialsId) {
-            // The login body is written from the credential without printing it in the log
+            // The login body is written from the credential without printing it in the log.
+            // Single quotes on purpose: no Groovy interpolation in a step that handles secrets.
             withCredentials([usernamePassword(credentialsId: loginCredentialsId,
                                               usernameVariable: 'SMOKE_USER',
                                               passwordVariable: 'SMOKE_PASS')]) {
-                sh """
-                    printf '{"username":"%s","password":"%s"}' "\$SMOKE_USER" "\$SMOKE_PASS" > ${loginFile}
-                    printf '{"username":"%s","password":"%s"}' "\$SMOKE_USER" "smoke-wrong-password" > ${dir}/login-bad.json
-                """
+                withEnv(["SMOKE_DIR=${dir}"]) {
+                    sh '''
+                        printf '{"username":"%s","password":"%s"}' "$SMOKE_USER" "$SMOKE_PASS" > "$SMOKE_DIR/login.json"
+                        printf '{"username":"%s","password":"%s"}' "$SMOKE_USER" "smoke-wrong-password" > "$SMOKE_DIR/login-bad.json"
+                    '''
+                }
             }
         } else {
             sh "printf '{}' > ${loginFile}; printf '{}' > ${dir}/login-bad.json"
