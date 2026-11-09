@@ -23,6 +23,7 @@ def call(Map rawConfig = [:]) {
 
         environment {
             GRADLE_OPTS = '-Dorg.gradle.daemon=false'
+            DOCKER_BUILDKIT = '1'
         }
 
         stages {
