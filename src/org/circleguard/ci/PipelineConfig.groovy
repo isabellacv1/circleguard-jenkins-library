@@ -42,6 +42,9 @@ class PipelineConfig implements Serializable {
         [name: 'web',       port: 8081, path: '/'],
     ]
 
+    // Frees Docker disk space on the Jenkins host after every build.
+    boolean dockerCleanup = true
+
     // Post-deployment smoke tests (HU-15).
     boolean smokeTests = true
     String smokeCredentialsId = 'e2e-credential'  // user for the login check (null skips it)
@@ -86,6 +89,7 @@ class PipelineConfig implements Serializable {
         this.healthRetries = c.healthRetries ? c.healthRetries as int : this.healthRetries
         this.healthIntervalSeconds = c.healthIntervalSeconds ? c.healthIntervalSeconds as int : this.healthIntervalSeconds
         this.services = c.services ?: this.services
+        this.dockerCleanup = c.dockerCleanup != null ? c.dockerCleanup as boolean : this.dockerCleanup
         this.smokeTests = c.smokeTests != null ? c.smokeTests as boolean : this.smokeTests
         this.smokeCredentialsId = c.containsKey('smokeCredentialsId') ? c.smokeCredentialsId : this.smokeCredentialsId
         this.smokeTimeout = c.smokeTimeout ? c.smokeTimeout as int : this.smokeTimeout

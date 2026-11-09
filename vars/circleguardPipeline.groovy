@@ -253,6 +253,12 @@ def call(Map rawConfig = [:]) {
         post {
             always {
                 publishTestReports()
+                // Remove BuildKit cache, dangling images and test leftovers (never fails the build)
+                script {
+                    if (cfg.dockerCleanup) {
+                        dockerCleanup()
+                    }
+                }
             }
             success {
                 echo 'Build and tests passed.'
