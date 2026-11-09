@@ -139,3 +139,30 @@ globalLibraries:
           git:
             remote: "https://github.com/isabellacv1/circleguard-jenkins-library.git"
 ```
+
+## Post-deployment smoke tests (HU-15)
+
+After `Verify deployment`, the `Smoke tests` stage runs `smokeTests()` against the deployed environment.
+The same checks run after every promotion (stage, prod).
+
+| Check | Request | Expected |
+|-------|---------|----------|
+| web home page | `GET :8081/` | 200 and HTML |
+| web runtime configuration | `GET :8081/env-config.js` | 200 and `__ENV__` |
+| gateway validates a token | `POST :8087/api/v1/gate/validate` | 200 and a validation result |
+| form lists pending surveys | `GET :8086/api/v1/certificates/pending` | 200 |
+| promotion health stats | `GET :8088/api/v1/health-status/stats` | 200 and JSON |
+| identity requires auth | `GET :8083/api/v1/identities/lookup/<id>` without token | 401 or 403 |
+| auth login with valid user | `POST :8180/api/v1/auth/login` (credential `e2e-credential`) | 200 and a token |
+| auth rejects a wrong password | `POST :8180/api/v1/auth/login` | 401 |
+
+- Every check expects a specific status (and body fragment), unlike `verifyServices`, which accepts any answer below 500.
+- The checks run on the target host over SSH against `localhost`, so the application ports do not need to be open to Jenkins.
+- Results: JUnit report `smoke-tests/smoke-<env>.xml` (Tests tab) and `smoke-tests/smoke-<env>.txt` (artifact).
+- If a check fails, the build fails and its description says `smoke tests FAILED on <env>`.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `smokeTests` | `true` | Runs the smoke tests after the deployment and after each promotion. |
+| `smokeCredentialsId` | `e2e-credential` | Username/password credential for the login check (`null` skips the login checks). |
+| `smokeTimeout` | `10` | Smoke tests stage timeout (minutes). |

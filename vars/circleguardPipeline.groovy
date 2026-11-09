@@ -150,6 +150,24 @@ def call(Map rawConfig = [:]) {
                 }
             }
 
+            // HU-15: functional smoke tests after the deployment. A deployment that does not
+            // pass them is marked as failed and the results are kept in the build.
+            stage('Smoke tests') {
+                when {
+                    expression { cfg.deploy && cfg.smokeTests && cfg.deployBranches.contains(env.BRANCH_NAME) }
+                }
+                options {
+                    timeout(time: cfg.smokeTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    smokeTests(
+                        host: env.DEPLOY_HOST,
+                        environment: cfg.environment,
+                        loginCredentialsId: cfg.smokeCredentialsId
+                    )
+                }
+            }
+
             // HU-14: end to end tests against the deployed dev environment.
             // They are the condition to promote the version to stage.
             stage('E2E tests') {
@@ -193,6 +211,8 @@ def call(Map rawConfig = [:]) {
                             manual: cfg.stageApproval,
                             approvalTimeout: cfg.approvalTimeout,
                             services: cfg.services,
+                            smokeTests: cfg.smokeTests,
+                            smokeCredentialsId: cfg.smokeCredentialsId,
                             retries: cfg.healthRetries,
                             intervalSeconds: cfg.healthIntervalSeconds,
                             evidenceFile: cfg.promotionRecordFile
@@ -219,6 +239,8 @@ def call(Map rawConfig = [:]) {
                             manual: cfg.prodApproval,
                             approvalTimeout: cfg.approvalTimeout,
                             services: cfg.services,
+                            smokeTests: cfg.smokeTests,
+                            smokeCredentialsId: cfg.smokeCredentialsId,
                             retries: cfg.healthRetries,
                             intervalSeconds: cfg.healthIntervalSeconds,
                             evidenceFile: cfg.promotionRecordFile

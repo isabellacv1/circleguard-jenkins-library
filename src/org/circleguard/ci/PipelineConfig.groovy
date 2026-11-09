@@ -42,6 +42,11 @@ class PipelineConfig implements Serializable {
         [name: 'web',       port: 8081, path: '/'],
     ]
 
+    // Post-deployment smoke tests (HU-15).
+    boolean smokeTests = true
+    String smokeCredentialsId = 'e2e-credential'  // user for the login check (null skips it)
+    int smokeTimeout = 10
+
     // Version promotion between environments (HU-14).
     boolean e2e = true                       // Playwright tests against the deployed dev
     int e2eTimeout = 20
@@ -81,6 +86,9 @@ class PipelineConfig implements Serializable {
         this.healthRetries = c.healthRetries ? c.healthRetries as int : this.healthRetries
         this.healthIntervalSeconds = c.healthIntervalSeconds ? c.healthIntervalSeconds as int : this.healthIntervalSeconds
         this.services = c.services ?: this.services
+        this.smokeTests = c.smokeTests != null ? c.smokeTests as boolean : this.smokeTests
+        this.smokeCredentialsId = c.containsKey('smokeCredentialsId') ? c.smokeCredentialsId : this.smokeCredentialsId
+        this.smokeTimeout = c.smokeTimeout ? c.smokeTimeout as int : this.smokeTimeout
         this.e2e = c.e2e != null ? c.e2e as boolean : this.e2e
         this.e2eTimeout = c.e2eTimeout ? c.e2eTimeout as int : this.e2eTimeout
         this.e2eCredentialsId = c.e2eCredentialsId ?: this.e2eCredentialsId
