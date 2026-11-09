@@ -149,6 +149,79 @@ def call(Map rawConfig = [:]) {
                     )
                 }
             }
+
+            // HU-14: end to end tests against the deployed dev environment.
+            // They are the condition to promote the version to stage.
+            stage('E2E tests') {
+                when {
+                    expression { cfg.deploy && cfg.e2e && cfg.deployBranches.contains(env.BRANCH_NAME) }
+                }
+                options {
+                    timeout(time: cfg.e2eTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    String base = "http://${env.DEPLOY_HOST}"
+                    runE2E(
+                        baseUrl: "${base}:8081",
+                        authBaseUrl: "${base}:8180",
+                        gatewayBaseUrl: "${base}:8087",
+                        credentialsId: cfg.e2eCredentialsId,
+                        image: cfg.e2eImage,
+                        timeoutMinutes: cfg.e2eTimeout
+                    )
+                }
+            }
+
+            // HU-14: dev -> stage, only after every previous validation passed.
+            stage('Promote to stage') {
+                when {
+                    expression { cfg.deploy && cfg.promote && cfg.deployBranches.contains(env.BRANCH_NAME) }
+                }
+                options {
+                    timeout(time: cfg.approvalTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        Map envCfg = promoteEnvironment(
+                            from: 'dev',
+                            to: 'stage',
+                            version: env.IMAGE_VERSION,
+                            manual: cfg.stageApproval,
+                            approvalTimeout: cfg.approvalTimeout,
+                            services: cfg.services,
+                            retries: cfg.healthRetries,
+                            intervalSeconds: cfg.healthIntervalSeconds,
+                            evidenceFile: cfg.promotionRecordFile
+                        )
+                        env.STAGE_HOST = envCfg.HOST
+                    }
+                }
+            }
+
+            // HU-14: stage -> prod, always behind a manual approval (input).
+            stage('Promote to prod') {
+                when {
+                    expression { cfg.deploy && cfg.promote && cfg.deployBranches.contains(env.BRANCH_NAME) }
+                }
+                options {
+                    timeout(time: cfg.approvalTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        promoteEnvironment(
+                            from: 'stage',
+                            to: 'prod',
+                            version: env.IMAGE_VERSION,
+                            manual: cfg.prodApproval,
+                            approvalTimeout: cfg.approvalTimeout,
+                            services: cfg.services,
+                            retries: cfg.healthRetries,
+                            intervalSeconds: cfg.healthIntervalSeconds,
+                            evidenceFile: cfg.promotionRecordFile
+                        )
+                    }
+                }
+            }
         }
 
         post {
