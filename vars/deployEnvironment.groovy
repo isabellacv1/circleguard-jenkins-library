@@ -71,7 +71,7 @@ def call(Map params = [:]) {
 
     withCredentials([sshUserPrivateKey(credentialsId: credentialId,
                                        usernameVariable: 'DEPLOY_SSH_USER',
-                                       privateKeyFileVariable: 'DEPLOY_SSH_KEY')]) {
+                                       keyFileVariable: 'DEPLOY_SSH_KEY')]) {
         sh 'chmod 600 "$DEPLOY_SSH_KEY"'
 
         echo 'Copying the compose files to the host'

@@ -42,6 +42,17 @@ class PipelineConfig implements Serializable {
         [name: 'web',       port: 8081, path: '/'],
     ]
 
+    // Version promotion between environments (HU-14).
+    boolean e2e = true                       // Playwright tests against the deployed dev
+    int e2eTimeout = 20
+    String e2eCredentialsId = 'e2e-credentials'
+    String e2eImage = 'mcr.microsoft/playwright:v1.65.0'
+    boolean promote = false                  // dev -> stage -> prod
+    boolean stageApproval = false            // stage is promoted automatically after E2E
+    boolean prodApproval = true              // prod always waits for a manual input
+    int approvalTimeout = 240                // minutes the approver has to answer
+    String promotionRecordFile = 'promotion-record.txt'
+
     int buildTimeout = 30
     int testTimeout = 45
     int integrationTimeout = 30
@@ -70,6 +81,15 @@ class PipelineConfig implements Serializable {
         this.healthRetries = c.healthRetries ? c.healthRetries as int : this.healthRetries
         this.healthIntervalSeconds = c.healthIntervalSeconds ? c.healthIntervalSeconds as int : this.healthIntervalSeconds
         this.services = c.services ?: this.services
+        this.e2e = c.e2e != null ? c.e2e as boolean : this.e2e
+        this.e2eTimeout = c.e2eTimeout ? c.e2eTimeout as int : this.e2eTimeout
+        this.e2eCredentialsId = c.e2eCredentialsId ?: this.e2eCredentialsId
+        this.e2eImage = c.e2eImage ?: this.e2eImage
+        this.promote = c.promote != null ? c.promote as boolean : this.promote
+        this.stageApproval = c.stageApproval != null ? c.stageApproval as boolean : this.stageApproval
+        this.prodApproval = c.prodApproval != null ? c.prodApproval as boolean : this.prodApproval
+        this.approvalTimeout = c.approvalTimeout ? c.approvalTimeout as int : this.approvalTimeout
+        this.promotionRecordFile = c.promotionRecordFile ?: this.promotionRecordFile
         this.buildTimeout = c.buildTimeout ? c.buildTimeout as int : this.buildTimeout
         this.testTimeout = c.testTimeout ? c.testTimeout as int : this.testTimeout
         this.integrationTimeout = c.integrationTimeout ? c.integrationTimeout as int : this.integrationTimeout
