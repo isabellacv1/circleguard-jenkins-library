@@ -91,11 +91,15 @@ def call(Map params = [:]) {
     }
 
     String dir = (workDir in ['', '.']) ? mountPoint : "${mountPoint}/${workDir}"
-    String mount = "--mount type=volume,source=${volume},destination=${mountPoint},volume-subpath=${subPath}"
+    // `--mount` must stay OUTSIDE the quotes together with its value: quoting the
+    // flag and the value as one word would make the shell pass
+    // "--mount type=volume,..." as a single argument, and the Docker CLI would
+    // parse the flag name as "mount type" -> `unknown flag: --mount type`.
+    String mountSpec = "type=volume,source=${volume},destination=${mountPoint},volume-subpath=${subPath}"
     String envArgs = envVars.collect { "-e ${it}" }.join(' ')
 
     String script = "docker run --rm --user \$(id -u):\$(id -g) -e HOME=${home} " +
-                    "'${mount}' -w '${dir}' ${envArgs} ${image} ${command}"
+                    "--mount '${mountSpec}' -w '${dir}' ${envArgs} ${image} ${command}"
 
     echo "runInContainer: ${image} :: ${command}"
 

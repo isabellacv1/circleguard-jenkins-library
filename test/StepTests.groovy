@@ -49,6 +49,45 @@ def test = { String name, Closure body ->
 GroovyClassLoader loader = new GroovyClassLoader(this.class.classLoader)
 
 /**
+ * Splits a shell command into argv tokens, honouring single/double quotes and
+ * keeping `$( ... )` substitutions in one token. Used to reproduce what the
+ * `sh` step of Jenkins really passes to `docker`.
+ */
+def tokenizeShell = { String s ->
+    List<String> tokens = []
+    StringBuilder cur = new StringBuilder()
+    boolean single = false
+    boolean dbl = false
+    int i = 0
+    while (i < s.length()) {
+        char c = s.charAt(i)
+        if (!single && !dbl && c == ('$' as char) && i + 1 < s.length() && s.charAt(i + 1) == ('(' as char)) {
+            int depth = 1
+            cur.append('$(')
+            i += 2
+            while (i < s.length() && depth > 0) {
+                char cc = s.charAt(i)
+                if (cc == ('(' as char)) { depth++ }
+                else if (cc == (')' as char)) { depth-- }
+                cur.append(cc)
+                i++
+            }
+            continue
+        }
+        if (c == ("'" as char) && !dbl) { single = !single; i++; continue }
+        if (c == ('"' as char) && !single) { dbl = !dbl; i++; continue }
+        if (Character.isWhitespace(c) && !single && !dbl) {
+            if (cur.length() > 0) { tokens << cur.toString(); cur.setLength(0) }
+            i++; continue
+        }
+        cur.append(c)
+        i++
+    }
+    if (cur.length() > 0) { tokens << cur.toString() }
+    tokens
+}
+
+/**
  * Instantiates a step with a stubbed Jenkins environment.
  *
  * Returns a map with: script, sh (recorded commands), logs, archived, withEnv.
@@ -125,8 +164,8 @@ test('builds a docker run command bound to the job workspace only') {
     assert cmd.contains('--user $(id -u):$(id -g)')
     assert cmd.contains('-e HOME=/tmp')
     // H1: only the subdirectory of the job is mounted, through volume-subpath
-    assert cmd.contains("--mount type=volume,source=circleguard-jenkins-home," +
-                        'destination=/ws,volume-subpath=workspace/circleguard_dev')
+    assert cmd.contains("--mount 'type=volume,source=circleguard-jenkins-home," +
+                        "destination=/ws,volume-subpath=workspace/circleguard_dev'")
     assert cmd.contains("-w '/ws'")
     // ... the whole volume is NOT exposed and no host path is used
     assert !cmd.contains('-v circleguard-jenkins-home')
@@ -143,6 +182,29 @@ test('translates the workdir inside the workspace mount') {
                   workDir: 'infra/terraform/envs/dev')
     assert h.sh[0].contains("-w '/ws/infra/terraform/envs/dev'")
     assert h.sh[0].contains('volume-subpath=workspace/circleguard_dev')
+}
+
+test('splits --mount from its value when the shell tokenizes the command') {
+    // Regression: quoting the flag together with its value made the shell pass
+    // "--mount type=..." as ONE argument, and the Docker CLI failed with
+    // `unknown flag: --mount type` (pflag reads the flag name as "mount type").
+    def h = newStep('runInContainer')
+    h.script.call(image: 'hashicorp/terraform:1.17.2', command: 'fmt -check')
+    List<String> tokens = tokenizeShell(h.sh[0])
+
+    int mount = tokens.indexOf('--mount')
+    assert mount > 0: "--mount must be its own token: ${tokens}"
+    assert !tokens.any { it.startsWith('--mount ') }: "the flag must not carry its value: ${tokens}"
+    assert tokens[mount + 1].startsWith('type=volume,'): tokens[mount + 1]
+    assert tokens[mount + 1].contains('source=circleguard-jenkins-home'): tokens[mount + 1]
+    assert tokens[mount + 1].contains('volume-subpath=workspace/circleguard_dev'): tokens[mount + 1]
+
+    // -w and its value must also be separate tokens
+    int w = tokens.indexOf('-w')
+    assert w > 0 && tokens[w + 1] == '/ws': "wrong -w tokenisation: ${tokens}"
+    // the image and its command remain separate
+    assert tokens.contains('hashicorp/terraform:1.17.2')
+    assert tokens.last() == 'fmt -check' || tokens[-2..-1].join(' ') == 'fmt -check'
 }
 
 test('refuses a workspace outside /var/jenkins_home/workspace') {
