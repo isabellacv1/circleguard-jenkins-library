@@ -12,6 +12,9 @@ vars/gradlew.groovy                            runs ./gradlew tasks
 vars/configureTestcontainers.groovy            Testcontainers networking inside Jenkins
 vars/publishTestReports.groovy                 JUnit results + test/JaCoCo reports
 vars/sonarAnalysis.groovy                      SonarQube analysis + quality gate (optional)
+vars/runInContainer.groovy                     runs a command in a container with access to the workspace
+vars/terraformValidate.groovy                  terraform fmt -check + init -backend=false + validate
+vars/trivyScan.groovy                          trivy config (IaC), blocks on HIGH/CRITICAL
 vars/resolveVersion.groovy                     semantic version for the images (from release tags)
 vars/publishImages.groovy                      docker build + push to the Nexus registry
 vars/ensureBuildx.groovy                       installs the Docker buildx plugin if missing (BuildKit)
@@ -68,6 +71,17 @@ circleguardPipeline(
 | `prodApproval` | `true` | `true` waits for a manual approval (`input`) before promoting to prod. |
 | `approvalTimeout` | `240` | Minutes the approver has to answer the `input`. |
 | `promotionRecordFile` | `promotion-record.txt` | Artifact with the evidence of every promotion. |
+| `terraformValidate` | `false` | Runs `terraform fmt -check`, `terraform init -backend=false` and `terraform validate` on every root. No AWS credentials, no `plan`/`apply`. |
+| `terraformImage` | `hashicorp/terraform:1.17.2` | Pinned Terraform image. Must be `>= 1.10`: the backends declare `use_lockfile`. |
+| `terraformRoots` | `infra/terraform/envs/dev` | Roots validated by the step (paths relative to the workspace). **Only DEV** until the first real run is validated; STAGE, PROD and `backend-bootstrap` are added later. |
+| `terraformFmtPath` | `infra/terraform` | Directory checked with `terraform fmt -check -recursive`. |
+| `terraformValidateTimeout` | `15` | Terraform stage timeout (minutes). |
+| `terraformMinFreeSpaceMB` | `1500` | Free space (MB) required in the workspace **before** any Terraform command runs. |
+| `trivyScan` | `false` | Runs `trivy config`; a HIGH/CRITICAL finding fails the build. |
+| `trivyImage` | `aquasec/trivy:0.76.2` | Pinned Trivy image. |
+| `trivyPaths` | `['infra/terraform']` | Directories scanned (Trivy accepts one target per invocation). |
+| `trivySeverity` | `HIGH,CRITICAL` | Severities that block the build. |
+| `trivyTimeout` | `15` | Trivy stage timeout (minutes). |
 
 ### Stages
 
@@ -78,12 +92,122 @@ circleguardPipeline(
 | Tests | `./gradlew test --continue` |
 | Integration tests | `./gradlew integrationTest --continue` (if `integrationTests`) |
 | SonarQube | analysis + quality gate (if `sonar`) |
+| Terraform validate | `fmt -check`, `init -backend=false` and `validate` of every Terraform root (if `terraformValidate`) |
+| Trivy IaC | `trivy config` of `trivyPaths`; HIGH/CRITICAL findings fail the build and the report is archived (if `trivyScan`) |
 | Publish images | `docker build` + `docker push` of every image (if `publish` and branch in `publishBranches`) |
 | Deploy | Copies the compose files to the target host over SSH and runs `docker compose up -d --wait` with the published images (if `deploy` and branch in `deployBranches`) |
 | Verify deployment | HTTP check of every component with retries; the build fails if a service does not answer (if `deploy`) |
 | E2E tests | Playwright tests in a container against the deployed `dev` (condition to promote, if `e2e`) |
 | Promote to stage | Deploys the **same version** to `stage` and verifies it; manual `input` only if `stageApproval` |
 | Promote to prod | Deploys the **same version** to `prod`, verifies it and archives `promotion-record.txt`; always behind a manual `input` |
+
+## Static validation of the infrastructure as code (Terraform + Trivy)
+
+Two optional stages that validate the Terraform code **before** anything is built.
+Both are **off by default** (`terraformValidate: false`, `trivyScan: false`) so the
+behaviour of the pipeline does not change until the project opts in, and neither
+of them needs AWS credentials.
+
+```groovy
+circleguardPipeline(
+    // ...
+    terraformValidate: true,
+    trivyScan: true
+)
+```
+
+| Step | Image (pinned) | Commands |
+|------|----------------|----------|
+| `terraformValidate` | `hashicorp/terraform:1.17.2` (≥ 1.10: `use_lockfile`) | `terraform fmt -check -recursive -no-color infra/terraform` · `terraform init -backend=false -no-color` · `terraform validate -no-color` (per root) |
+| `trivyScan` | `aquasec/trivy:0.76.2` | `trivy config <path> --severity HIGH,CRITICAL --exit-code 1 --format table --output trivy-iac-report-<build><-path>.txt --quiet --cache-dir /ws/.trivy-cache --skip-dirs ... --skip-files ...` |
+
+### Workspace isolation
+
+`runInContainer` does **not** mount the whole `circleguard-jenkins-home` volume
+(which holds `credentials.xml`, `secrets/` and the workspaces of every other
+job). It mounts **only the workspace of the job**, with the `volume-subpath`
+option of `--mount`:
+
+```bash
+docker run --rm --user $(id -u):$(id -g) -e HOME=/tmp \
+  --mount type=volume,source=circleguard-jenkins-home,destination=/ws,volume-subpath=workspace/<job> \
+  -w '/ws' <image> <command>
+```
+
+The workspace root is `/ws` inside the container, so steps that need a path in
+the workspace (Trivy cache, Terraform plugin cache) use `/ws/...`. Two guards run
+before the mount: the workspace must live under `/var/jenkins_home/workspace/`
+and it must already exist (it is created by `Checkout`, the first stage).
+
+> ⚠ **`volume-subpath` still needs a real `docker run` to be validated.** It is
+> documented by the Docker Engine and supported by the Docker 29.9.3 of the
+> host, but no container has been executed yet in this environment. If the mount
+> fails, the documented fallback is the previous behaviour: mount the whole
+> volume (`-v circleguard-jenkins-home:/jh`) and translate `/var/jenkins_home/...`
+> to `/jh/...` — which is still what `runE2E` does.
+
+Rules enforced by the steps:
+
+- **No `plan`, `apply` or `destroy`** is ever executed, and `init` runs with
+  `-backend=false`, so the S3 backend is never contacted and no state is migrated.
+- **No `.tf` file is modified**: `fmt` runs with `-check` (a badly formatted file
+  fails the build instead of being rewritten) and `init` never uses `-upgrade`, so
+  `.terraform.lock.hcl` is not rewritten.
+- **The images must be pinned**: `:latest` and untagged images are rejected by
+  `runInContainer`.
+- **The report is kept and is never stale**: the report is named
+  `trivy-iac-report-<build>[<-path>].txt`, so the report of a previous build can
+  never be archived as evidence of the current one. It is echoed to the log and
+  archived with the build, also when the stage fails, and the error message says
+  whether a report was generated or not.
+- **No secrets in the log**: `trivy config` only runs the misconfiguration scanner
+  (it never scans for secrets), and the state files and saved plans are excluded.
+- **The Trivy cache is per job**: it lives in the workspace (`/ws/.trivy-cache`),
+  created by the non-root user of the container, so two concurrent builds never
+  share the same bbolt database (Trivy fails with *"cache may be in use by another
+  process"* when another process holds the lock).
+- **The disk is checked first**: `terraformValidate` reads the free space of the
+  workspace and aborts **before running any Terraform command** when it is below
+  `terraformMinFreeSpaceMB`, reporting only the available space and the threshold.
+- **The AWS provider is downloaded once**: `TF_PLUGIN_CACHE_DIR` points to
+  `<workspace>/.terraform-plugin-cache` (persistent for dev/main, isolated per
+  job). Terraform downloads the ~772 MB provider there once and **links** it into
+  `.terraform/providers/...` of each root ("Terraform will use symbolic links to
+  avoid storing a separate copy of a cached plugin in multiple directories").
+  What stays in `.terraform`: those links, `modules/modules.json` (the modules of
+  this project are local) and the `environment` marker — no state. Expected disk:
+  ~772 MB in the cache plus a few KB per root, instead of 772 MB per root.
+
+### Exclusions
+
+Always excluded from the scan (passed to Trivy as `--skip-dirs`/`--skip-files`):
+`.git`, `.terraform` (downloaded providers/modules), `.trivy-cache` (the cache of
+the step itself) and every `*.tfstate*` / `*.tfplan*` file, including the backups
+of `backend-bootstrap`.
+
+### Justified exceptions
+
+Never disable the scan globally. If a finding is accepted on purpose, create
+`.trivyignore.yaml` in the workspace root with the **specific check id** and the
+reason:
+
+```yaml
+# accepted: documented in HU2 (state lifecycle), reviewed2026-11-17
+- AVD-AWS-0123
+```
+
+The step passes the file to Trivy with `--ignorefile` **only when it exists**, so
+the repository does not need the file until there is a real exception.
+
+### Tests
+
+`test/StepTests.groovy` covers both steps without Docker, network or AWS (every
+Jenkins step is stubbed). See [`test/README.md`](test/README.md):
+
+```bash
+java -cp "$(find ~/.gradle -name 'groovy-5*.jar' | head -1)" \
+     groovy.ui.GroovyMain test/StepTests.groovy
+```
 
 ### Image versions
 

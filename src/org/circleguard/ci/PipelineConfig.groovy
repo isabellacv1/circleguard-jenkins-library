@@ -61,6 +61,25 @@ class PipelineConfig implements Serializable {
     int approvalTimeout = 240                // minutes the approver has to answer
     String promotionRecordFile = 'promotion-record.txt'
 
+    // Static validation of the infrastructure as code (Terraform + Trivy).
+    // Off by default: enabling it pulls the pinned images on the first build.
+    // Neither step needs AWS credentials, and none of them runs plan/apply.
+    boolean terraformValidate = false        // fmt -check + init -backend=false + validate
+    String terraformImage = 'hashicorp/terraform:1.17.2'   // >= 1.10: use_lockfile needs it
+    // DEV only until the first real run is validated (STAGE/PROD are added later):
+    // each root needs ~772 MB of providers, shared through the plugin cache.
+    List<String> terraformRoots = ['infra/terraform/envs/dev']
+    String terraformFmtPath = 'infra/terraform'
+    int terraformValidateTimeout = 15
+    // Free space required in the workspace before running any Terraform command.
+    int terraformMinFreeSpaceMB = 1500
+
+    boolean trivyScan = false                // trivy config, blocks on HIGH/CRITICAL
+    String trivyImage = 'aquasec/trivy:0.76.2'
+    List<String> trivyPaths = ['infra/terraform']
+    String trivySeverity = 'HIGH,CRITICAL'
+    int trivyTimeout = 15
+
     int buildTimeout = 30
     int testTimeout = 45
     int integrationTimeout = 30
@@ -102,6 +121,17 @@ class PipelineConfig implements Serializable {
         this.prodApproval = c.prodApproval != null ? c.prodApproval as boolean : this.prodApproval
         this.approvalTimeout = c.approvalTimeout ? c.approvalTimeout as int : this.approvalTimeout
         this.promotionRecordFile = c.promotionRecordFile ?: this.promotionRecordFile
+        this.terraformValidate = c.terraformValidate != null ? c.terraformValidate as boolean : this.terraformValidate
+        this.terraformImage = c.terraformImage ?: this.terraformImage
+        this.terraformRoots = c.terraformRoots ?: this.terraformRoots
+        this.terraformFmtPath = c.terraformFmtPath ?: this.terraformFmtPath
+        this.terraformValidateTimeout = c.terraformValidateTimeout ? c.terraformValidateTimeout as int : this.terraformValidateTimeout
+        this.terraformMinFreeSpaceMB = c.terraformMinFreeSpaceMB ? c.terraformMinFreeSpaceMB as int : this.terraformMinFreeSpaceMB
+        this.trivyScan = c.trivyScan != null ? c.trivyScan as boolean : this.trivyScan
+        this.trivyImage = c.trivyImage ?: this.trivyImage
+        this.trivyPaths = c.trivyPaths ?: this.trivyPaths
+        this.trivySeverity = c.trivySeverity ?: this.trivySeverity
+        this.trivyTimeout = c.trivyTimeout ? c.trivyTimeout as int : this.trivyTimeout
         this.buildTimeout = c.buildTimeout ? c.buildTimeout as int : this.buildTimeout
         this.testTimeout = c.testTimeout ? c.testTimeout as int : this.testTimeout
         this.integrationTimeout = c.integrationTimeout ? c.integrationTimeout as int : this.integrationTimeout

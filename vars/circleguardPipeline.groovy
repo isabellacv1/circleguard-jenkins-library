@@ -82,6 +82,48 @@ def call(Map rawConfig = [:]) {
                 }
             }
 
+            // Static validation of the Terraform code. Off by default (terraformValidate:
+            // false): it needs no AWS credentials and never runs plan/apply, but it pulls
+            // the pinned image on the first build.
+            stage('Terraform validate') {
+                when {
+                    expression { cfg.terraformValidate }
+                }
+                options {
+                    timeout(time: cfg.terraformValidateTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        terraformValidate(
+                            image: cfg.terraformImage,
+                            roots: cfg.terraformRoots,
+                            fmtPath: cfg.terraformFmtPath,
+                            minFreeSpaceMB: cfg.terraformMinFreeSpaceMB
+                        )
+                    }
+                }
+            }
+
+            // Trivy misconfiguration scan of the Terraform code: HIGH/CRITICAL findings
+            // fail the build and the report is archived with it. Off by default.
+            stage('Trivy IaC') {
+                when {
+                    expression { cfg.trivyScan }
+                }
+                options {
+                    timeout(time: cfg.trivyTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        trivyScan(
+                            image: cfg.trivyImage,
+                            paths: cfg.trivyPaths,
+                            severity: cfg.trivySeverity
+                        )
+                    }
+                }
+            }
+
             stage('Publish images') {
                 when {
                     expression { cfg.publish && cfg.publishBranches.contains(env.BRANCH_NAME) }
