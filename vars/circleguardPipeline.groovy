@@ -124,6 +124,31 @@ def call(Map rawConfig = [:]) {
                 }
             }
 
+            // Terraform plan against the real S3 backend (plan only: this phase
+            // never runs `apply`, and the saved plan is not archived).
+            // DEV only: the flag AND the branch are both required, so PRs and
+            // any other branch never receive the AWS credential.
+            stage('Terraform plan') {
+                when {
+                    expression { cfg.terraformPlan && cfg.terraformPlanBranches.contains(env.BRANCH_NAME) }
+                }
+                options {
+                    timeout(time: cfg.terraformPlanTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        terraformPlan(
+                            image: cfg.terraformImage,
+                            root: cfg.terraformPlanRoot,
+                            credentialsId: cfg.terraformAwsCredentialsId,
+                            region: cfg.terraformAwsRegion,
+                            minFreeSpaceMB: cfg.terraformMinFreeSpaceMB,
+                            timeout: cfg.terraformPlanTimeout
+                        )
+                    }
+                }
+            }
+
             stage('Publish images') {
                 when {
                     expression { cfg.publish && cfg.publishBranches.contains(env.BRANCH_NAME) }

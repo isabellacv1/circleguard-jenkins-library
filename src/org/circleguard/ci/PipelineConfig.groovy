@@ -80,6 +80,20 @@ class PipelineConfig implements Serializable {
     String trivySeverity = 'HIGH,CRITICAL'
     int trivyTimeout = 15
 
+    // Terraform plan against the REAL S3 backend (plan only: no apply, no
+    // artifact). Off by default because it needs AWS credentials and contacts
+    // the backend; enabling it never changes the behaviour of the other stages.
+    boolean terraformPlan = false
+    // Single root on purpose: it must NOT follow terraformRoots (a root added
+    // to the validate list would otherwise start being planned automatically).
+    String terraformPlanRoot = 'infra/terraform/envs/dev'
+    // Only the dev branch plans: PRs and any other branch never receive the
+    // AWS credential (the stage gate and this list are both required).
+    List<String> terraformPlanBranches = ['dev']
+    String terraformAwsCredentialsId = 'aws-terraform-credentials'
+    String terraformAwsRegion = 'us-east-1'
+    int terraformPlanTimeout = 20            // stage budget AND per-command timeout
+
     int buildTimeout = 30
     int testTimeout = 45
     int integrationTimeout = 30
@@ -132,6 +146,12 @@ class PipelineConfig implements Serializable {
         this.trivyPaths = c.trivyPaths ?: this.trivyPaths
         this.trivySeverity = c.trivySeverity ?: this.trivySeverity
         this.trivyTimeout = c.trivyTimeout ? c.trivyTimeout as int : this.trivyTimeout
+        this.terraformPlan = c.terraformPlan != null ? c.terraformPlan as boolean : this.terraformPlan
+        this.terraformPlanRoot = c.terraformPlanRoot ?: this.terraformPlanRoot
+        this.terraformPlanBranches = c.terraformPlanBranches ?: this.terraformPlanBranches
+        this.terraformAwsCredentialsId = c.terraformAwsCredentialsId ?: this.terraformAwsCredentialsId
+        this.terraformAwsRegion = c.terraformAwsRegion ?: this.terraformAwsRegion
+        this.terraformPlanTimeout = c.terraformPlanTimeout ? c.terraformPlanTimeout as int : this.terraformPlanTimeout
         this.buildTimeout = c.buildTimeout ? c.buildTimeout as int : this.buildTimeout
         this.testTimeout = c.testTimeout ? c.testTimeout as int : this.testTimeout
         this.integrationTimeout = c.integrationTimeout ? c.integrationTimeout as int : this.integrationTimeout

@@ -48,6 +48,10 @@ def test = { String name, Closure body ->
 
 GroovyClassLoader loader = new GroovyClassLoader(this.class.classLoader)
 
+// Parsed once: terraformPlan reuses the free-space parser of terraformValidate
+// (terraformValidate.freeSpaceMB), so the real step must be bindable.
+def validateTemplate = loader.parseClass(new File(root, 'vars/terraformValidate.groovy'))
+
 /**
  * Splits a shell command into argv tokens, honouring single/double quotes and
  * keeping `$( ... )` substitutions in one token. Used to reproduce what the
@@ -90,7 +94,8 @@ def tokenizeShell = { String s ->
 /**
  * Instantiates a step with a stubbed Jenkins environment.
  *
- * Returns a map with: script, sh (recorded commands), logs, archived, withEnv.
+ * Returns a map with: script, sh (recorded commands), logs, archived, withEnv,
+ * withCredentials (the bindings recorded by the stubbed withCredentials).
  * opts.status     exit code returned by sh(..., returnStatus: true)
  * opts.missing    paths for which fileExists() answers false
  * opts.files      contents returned by readFile()
@@ -105,7 +110,8 @@ def newStep = { String name, Map opts = [:] ->
         sh      : [],
         logs    : [],
         archived: [],
-        withEnv : []
+        withEnv : [],
+        withCredentials: []
     ]
     def binding = new Binding()
     binding.setVariable('env', b.env)
@@ -135,6 +141,19 @@ def newStep = { String name, Map opts = [:] ->
         b.withEnv << (vars.collect { it.toString() })
         return body.call()
     })
+    // withCredentials records the bindings, runs the body and returns its value,
+    // like the real step; usernamePassword() returns its arguments, so a test can
+    // assert the credential id and the variable names WITHOUT reading any secret.
+    binding.setVariable('usernamePassword', { Object args -> args })
+    binding.setVariable('withCredentials', { Object bindings, Closure body ->
+        b.withCredentials << bindings
+        return body.call()
+    })
+    // terraformPlan reuses the free-space parser of terraformValidate: the real
+    // step is bound so that terraformValidate.freeSpaceMB() is the production one.
+    def validate = validateTemplate.newInstance()
+    validate.binding = binding
+    binding.setVariable('terraformValidate', validate)
     binding.setVariable('fileExists', { Object p -> !(opts.missing ?: []).contains(p) })
     binding.setVariable('readFile', { Object p -> (opts.files ?: [:])[p] ?: "REPORT:${p}" })
     binding.setVariable('writeFile', { Object a -> })
@@ -149,7 +168,8 @@ def newStep = { String name, Map opts = [:] ->
     container.binding = binding
     binding.setVariable('runInContainer', { Map p -> container.call(p) })
 
-    [script: script, sh: b.sh, logs: b.logs, archived: b.archived, withEnv: b.withEnv]
+    [script: script, sh: b.sh, logs: b.logs, archived: b.archived,
+     withEnv: b.withEnv, withCredentials: b.withCredentials]
 }
 
 println 'runInContainer'
@@ -473,6 +493,199 @@ test('rejects an empty path list and a missing path') {
     assert missing.sh.isEmpty(): 'nothing must run when the path does not exist'
 }
 
+println 'terraformPlan'
+test('plans DEV against the real S3 backend with the credential bound by name') {
+    def h = newStep('terraformPlan')
+    def result = h.script.call(root: 'infra/terraform/envs/dev')
+
+    // df + mkdir (plugin cache) + rm (stale plan) + docker init + docker plan
+    assert h.sh.size() == 5: "expected 5 commands, got ${h.sh.size()}"
+    assert h.sh[0].startsWith('df -Pk'): 'the disk must be checked first'
+    assert !h.sh[0].contains('docker run'): 'no container may start before the disk check'
+    assert h.sh[1].contains('.terraform-plugin-cache'): 'the plugin cache must be created'
+    assert h.sh[1].contains('/var/jenkins_home/workspace/circleguard_dev/')
+    assert h.sh[2] == 'rm -f "infra/terraform/envs/dev/ci-dev.tfplan"': h.sh[2]
+
+    String init = h.sh[3]
+    String plan = h.sh[4]
+    assert init.contains(' init -backend=true -no-color -input=false'): init
+    assert !init.contains('-backend=false'): 'the REAL S3 backend is required'
+    assert !init.contains('-reconfigure') && !init.contains('-migrate-state'): 'the state must never be reconfigured'
+    assert init.contains("-w '/ws/infra/terraform/envs/dev'")
+    assert plan.contains(' plan -no-color -input=false -lock=true -detailed-exitcode ' +
+                         '-out=ci-dev.tfplan'): plan
+    assert plan.contains("-w '/ws/infra/terraform/envs/dev'")
+
+    // env vars by NAME only: no value, no interpolation, no secret in a command
+    [init, plan].each { String cmd ->
+        ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_DEFAULT_REGION',
+         'TF_IN_AUTOMATION', 'TF_INPUT', 'TF_PLUGIN_CACHE_DIR'].each { String v ->
+            assert cmd.contains("-e ${v}"): "missing -e ${v} in ${cmd}"
+            assert !cmd.contains("-e ${v}="): "the VALUE of ${v} must not be in the command: ${cmd}"
+        }
+        assert !cmd.contains('${'): "no shell interpolation of a value: ${cmd}"
+        assert !cmd.contains(' apply'): "apply must never run: ${cmd}"
+        assert !cmd.contains('destroy'): "destroy must never run: ${cmd}"
+        assert !cmd.contains('-replace'): "no forced replacement: ${cmd}"
+        assert !cmd.contains('-upgrade'): "the lockfile must not be upgraded: ${cmd}"
+        assert !cmd.contains('-var '): "variables are never injected: ${cmd}"
+    }
+
+    // the credential is bound exactly once, with the required id and variables
+    assert h.withCredentials.size() == 1: 'the credential must be bound once'
+    assert h.withCredentials[0].size() == 1
+    Map cred = h.withCredentials[0][0]
+    assert cred.credentialsId == 'aws-terraform-credentials': cred
+    assert cred.usernameVariable == 'AWS_ACCESS_KEY_ID': cred
+    assert cred.passwordVariable == 'AWS_SECRET_ACCESS_KEY': cred
+
+    // non-secret environment, scoped with withEnv
+    assert h.withEnv.size() == 1: 'the environment must be scoped to the Terraform commands'
+    List envEntries = h.withEnv[0]
+    assert envEntries.contains('AWS_DEFAULT_REGION=us-east-1'): envEntries
+    assert envEntries.contains('TF_IN_AUTOMATION=1'): envEntries
+    assert envEntries.contains('TF_INPUT=0'): envEntries
+    assert envEntries.contains('TF_PLUGIN_CACHE_DIR=/ws/.terraform-plugin-cache'): envEntries
+
+    // the plan stays in the workspace and is never downloadable
+    assert h.archived.isEmpty(): 'the plan must not be archived as an artifact'
+    assert result.root == 'infra/terraform/envs/dev'
+    assert result.planFile == 'infra/terraform/envs/dev/ci-dev.tfplan'
+    assert result.status == 0
+    assert result.changes == false
+    assert h.logs.any { it.contains('NO changes') }: h.logs
+}
+
+test('reports changes when -detailed-exitcode returns 2') {
+    def h = newStep('terraformPlan', [status: 2])
+    def result = h.script.call(root: 'infra/terraform/envs/dev')
+    assert result.status == 2
+    assert result.changes == true
+    assert h.logs.any { it.contains('CHANGES pending') }: h.logs
+    assert h.archived.isEmpty()
+}
+
+test('fails safely on exit code 1 and never widens the IAM policies') {
+    def h = newStep('terraformPlan', [status: 1])
+    try {
+        h.script.call(root: 'infra/terraform/envs/dev')
+        assert false: 'a failing plan must fail the step'
+    } catch (RuntimeException e) {
+        assert e.message.contains('exit 1'): e.message
+        assert e.message.contains('AccessDenied'): e.message
+        assert e.message.contains('do NOT widen'): e.message
+    }
+    assert h.archived.isEmpty(): 'no evidence of a failed plan may be archived'
+}
+
+test('fails when Terraform did not write the plan file') {
+    def h = newStep('terraformPlan', [missing: ['infra/terraform/envs/dev/ci-dev.tfplan']])
+    try {
+        h.script.call(root: 'infra/terraform/envs/dev')
+        assert false: 'a missing plan file must fail the step'
+    } catch (RuntimeException e) {
+        assert e.message.contains('did not write the plan file'): e.message
+        assert e.message.contains('ci-dev.tfplan'): e.message
+    }
+}
+
+test('aborts before Terraform and before binding the credential when the disk is full') {
+    def h = newStep('terraformPlan', [dfOutput: LOW_DF])
+    try {
+        h.script.call(root: 'infra/terraform/envs/dev')
+        assert false: 'an insufficient disk must fail the step'
+    } catch (RuntimeException e) {
+        assert e.message.contains('97 MB free'): e.message
+        assert e.message.contains('1500 MB required'): e.message
+        assert e.message.contains('Aborting before running Terraform'): e.message
+    }
+    assert h.sh.size() == 1: 'only df may run, nothing else'
+    assert h.sh[0].startsWith('df -Pk')
+    assert !h.sh[0].contains('docker run')
+    assert h.withCredentials.isEmpty(): 'the credential must not be bound on the abort path'
+    assert h.withEnv.isEmpty()
+    assert h.archived.isEmpty()
+}
+
+test('fails safely when the root or its versions.tf is missing') {
+    def noRoot = newStep('terraformPlan', [missing: ['infra/terraform/envs/dev']])
+    try {
+        noRoot.script.call(root: 'infra/terraform/envs/dev')
+        assert false: 'a missing root must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('does not exist'): e.message
+    }
+    assert noRoot.sh.isEmpty(): 'nothing must run when the root does not exist'
+    assert noRoot.withCredentials.isEmpty()
+
+    def noVersions = newStep('terraformPlan', [missing: ['infra/terraform/envs/dev/versions.tf']])
+    try {
+        noVersions.script.call(root: 'infra/terraform/envs/dev')
+        assert false: 'a root without versions.tf must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('versions.tf'): e.message
+    }
+    assert noVersions.sh.isEmpty(): 'nothing must run without the backend declaration'
+    assert noVersions.withCredentials.isEmpty()
+}
+
+test('rejects an unsafe root, a plan name without .tfplan and an empty credential id') {
+    def noRoot = newStep('terraformPlan')
+    try {
+        noRoot.script.call(root: null)
+        assert false: 'a missing root must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('root is required'): e.message
+    }
+
+    def escaping = newStep('terraformPlan')
+    try {
+        escaping.script.call(root: '../../secrets')
+        assert false: 'a root escaping the workspace must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('relative path'): e.message
+    }
+
+    def absolute = newStep('terraformPlan')
+    try {
+        absolute.script.call(root: '/etc')
+        assert false: 'an absolute root must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('relative path'): e.message
+    }
+
+    def badName = newStep('terraformPlan')
+    try {
+        badName.script.call(root: 'infra/terraform/envs/dev', planFile: 'plan.txt')
+        assert false: 'a plan file without .tfplan must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('.tfplan'): e.message
+    }
+
+    def noCredential = newStep('terraformPlan')
+    try {
+        noCredential.script.call(root: 'infra/terraform/envs/dev', credentialsId: '')
+        assert false: 'an empty credential id must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('credentialsId is required'): e.message
+    }
+    assert noCredential.sh.isEmpty(): 'nothing must run without a credential id'
+}
+
+test('never runs apply and never archives the plan (source level)') {
+    assert !new File(root, 'vars/terraformApply.groovy').exists():
+        'apply is not part of this phase'
+    String step = new File(root, 'vars/terraformPlan.groovy').text
+    assert !step.contains('archiveArtifacts'): 'the plan must not be downloadable'
+    assert step.contains("command: 'init -backend=true -no-color -input=false'"):
+        'the plan must initialise the real backend'
+    assert step.contains('withCredentials'): 'the credential must be bound explicitly'
+    assert step.contains("usernameVariable: 'AWS_ACCESS_KEY_ID'")
+    assert step.contains("passwordVariable: 'AWS_SECRET_ACCESS_KEY'")
+    assert step.contains('-detailed-exitcode')
+    assert step.contains('terraformValidate.freeSpaceMB'): 'the free-space parser must be reused'
+}
+
 println 'PipelineConfig'
 test('keeps the new stages disabled by default with pinned images and DEV only') {
     def cls = loader.parseClass(new File(root, 'src/org/circleguard/ci/PipelineConfig.groovy'))
@@ -512,6 +725,40 @@ test('accepts the parameters from the Jenkinsfile') {
     assert cfg.publish == false
 }
 
+test('keeps Terraform plan disabled by default, DEV only and without a credential') {
+    def cls = loader.parseClass(new File(root, 'src/org/circleguard/ci/PipelineConfig.groovy'))
+    def cfg = cls.getConstructor(Map).newInstance([:])
+
+    assert cfg.terraformPlan == false: 'the plan stage must be off by default'
+    assert cfg.terraformPlanRoot == 'infra/terraform/envs/dev': cfg.terraformPlanRoot
+    assert cfg.terraformPlanBranches == ['dev']: cfg.terraformPlanBranches
+    assert cfg.terraformAwsCredentialsId == 'aws-terraform-credentials'
+    assert cfg.terraformAwsRegion == 'us-east-1'
+    assert cfg.terraformPlanTimeout > 0
+}
+
+test('accepts the Terraform plan parameters from the Jenkinsfile') {
+    def cls = loader.parseClass(new File(root, 'src/org/circleguard/ci/PipelineConfig.groovy'))
+    def cfg = cls.getConstructor(Map).newInstance(
+        [terraformPlan: true,
+         terraformPlanRoot: 'infra/terraform/envs/stage',
+         terraformPlanBranches: ['main'],
+         terraformAwsCredentialsId: 'other-credentials',
+         terraformAwsRegion: 'eu-west-1',
+         terraformPlanTimeout: 45])
+
+    assert cfg.terraformPlan == true
+    assert cfg.terraformPlanRoot == 'infra/terraform/envs/stage'
+    assert cfg.terraformPlanBranches == ['main']
+    assert cfg.terraformAwsCredentialsId == 'other-credentials'
+    assert cfg.terraformAwsRegion == 'eu-west-1'
+    assert cfg.terraformPlanTimeout == 45
+    // untouched defaults keep their value
+    assert cfg.terraformValidate == false
+    assert cfg.trivyScan == false
+    assert cfg.publish == false
+}
+
 println 'circleguardPipeline (integration, source level)'
 test('still compiles with the new stages') {
     // a child loader so that PipelineConfig is visible to the import of the entry point
@@ -519,6 +766,7 @@ test('still compiles with the new stages') {
     child.parseClass(new File(root, 'src/org/circleguard/ci/PipelineConfig.groovy'))
     child.parseClass(new File(root, 'vars/circleguardPipeline.groovy'))
     child.parseClass(new File(root, 'vars/terraformValidate.groovy'))
+    child.parseClass(new File(root, 'vars/terraformPlan.groovy'))
     child.parseClass(new File(root, 'vars/trivyScan.groovy'))
     child.parseClass(new File(root, 'vars/runInContainer.groovy'))
 }
@@ -540,6 +788,33 @@ test('declares the new stages before Publish images and gates them by config') {
                                        text.indexOf("stage('Publish images')"))
     assert trivyStage.contains('expression { cfg.trivyScan }')
     assert trivyStage.contains('severity: cfg.trivySeverity')
+}
+
+test('declares the Terraform plan stage between Trivy and Publish, gated to dev') {
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+
+    assert text.contains("stage('Terraform plan')")
+    int plan = text.indexOf("stage('Terraform plan')")
+    assert plan > text.indexOf("stage('Trivy IaC')"): 'the plan must run after the IaC scan'
+    assert plan < text.indexOf("stage('Publish images')"): 'the plan must run before the images are built'
+
+    String block = text.substring(plan, text.indexOf("stage('Publish images')"))
+    // flag AND branch: PRs and every other branch are excluded from the credential
+    assert block.contains('cfg.terraformPlan && cfg.terraformPlanBranches.contains(env.BRANCH_NAME)')
+    assert block.contains('timeout(time: cfg.terraformPlanTimeout')
+    assert block.contains('root: cfg.terraformPlanRoot')
+    assert block.contains('credentialsId: cfg.terraformAwsCredentialsId')
+    assert block.contains('region: cfg.terraformAwsRegion')
+    assert block.contains('minFreeSpaceMB: cfg.terraformMinFreeSpaceMB')
+    assert !block.contains('terraformApply'): 'apply is not part of this phase'
+}
+
+test('does not introduce any apply stage or step') {
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+    assert !text.contains("stage('Terraform apply')"): 'no apply stage in this phase'
+    assert !text.contains('terraformApply('): 'no apply step in this phase'
+    assert !new File(root, 'vars/terraformApply.groovy').exists():
+        'vars/terraformApply.groovy must not exist yet'
 }
 
 test('keeps every pre-existing stage') {

@@ -82,6 +82,12 @@ circleguardPipeline(
 | `trivyPaths` | `['infra/terraform']` | Directories scanned (Trivy accepts one target per invocation). |
 | `trivySeverity` | `HIGH,CRITICAL` | Severities that block the build. |
 | `trivyTimeout` | `15` | Trivy stage timeout (minutes). |
+| `terraformPlan` | `false` | Runs `terraform init -backend=true` (real S3 backend) and `terraform plan -out=...` for a single root. Needs AWS credentials; **never** runs `apply` and never archives the plan. |
+| `terraformPlanRoot` | `infra/terraform/envs/dev` | Single root planned. Deliberately independent from `terraformRoots`, so a root added to the validate list is not planned automatically. |
+| `terraformPlanBranches` | `['dev']` | Branches that run the plan stage. **PRs and every other branch are excluded** (the stage requires the flag AND the branch). |
+| `terraformAwsCredentialsId` | `aws-terraform-credentials` | Username/password credential (Access Key ID / Secret Access Key) bound with `withCredentials` only around the Terraform commands. |
+| `terraformAwsRegion` | `us-east-1` | Value of `AWS_DEFAULT_REGION`, injected by name. |
+| `terraformPlanTimeout` | `20` | Plan stage budget and per-command timeout (minutes). |
 
 ### Stages
 
@@ -94,6 +100,7 @@ circleguardPipeline(
 | SonarQube | analysis + quality gate (if `sonar`) |
 | Terraform validate | `fmt -check`, `init -backend=false` and `validate` of every Terraform root (if `terraformValidate`) |
 | Trivy IaC | `trivy config` of `trivyPaths`; HIGH/CRITICAL findings fail the build and the report is archived (if `trivyScan`) |
+| Terraform plan | `terraform init -backend=true` + `terraform plan -detailed-exitcode -out=<root>/ci-<env>.tfplan` against the real S3 backend, with `aws-terraform-credentials` injected **by name** (if `terraformPlan` and branch in `terraformPlanBranches`) |
 | Publish images | `docker build` + `docker push` of every image (if `publish` and branch in `publishBranches`) |
 | Deploy | Copies the compose files to the target host over SSH and runs `docker compose up -d --wait` with the published images (if `deploy` and branch in `deployBranches`) |
 | Verify deployment | HTTP check of every component with retries; the build fails if a service does not answer (if `deploy`) |
@@ -148,8 +155,10 @@ and it must already exist (it is created by `Checkout`, the first stage).
 
 Rules enforced by the steps:
 
-- **No `plan`, `apply` or `destroy`** is ever executed, and `init` runs with
-  `-backend=false`, so the S3 backend is never contacted and no state is migrated.
+- **No `plan`, `apply` or `destroy`** is executed by `terraformValidate` or
+  `trivyScan`, and `terraformValidate` runs `init` with `-backend=false`, so the
+  S3 backend is never contacted and no state is migrated. (The separate
+  `Terraform plan` stage described below is the only one that contacts S3.)
 - **No `.tf` file is modified**: `fmt` runs with `-check` (a badly formatted file
   fails the build instead of being rewritten) and `init` never uses `-upgrade`, so
   `.terraform.lock.hcl` is not rewritten.
@@ -238,6 +247,90 @@ pipeline result is not changed.
 
 The steps in `vars/` can also be used on their own from any Jenkinsfile that loads the library,
 for example `gradlew 'build'` or `publishTestReports()`.
+
+## Terraform plan against the S3 backend (phase 1)
+
+Optional stage (`terraformPlan: false` by default) that runs a **real plan for
+one root, on the `dev` branch only**, and keeps the saved plan in the workspace
+of the same build. It never runs `apply`, never archives the plan and never
+changes the Terraform roots.
+
+```groovy
+circleguardPipeline(
+    // ...
+    terraformPlan: true          // root, branch and credential come from the defaults
+)
+```
+
+| Step | Image (pinned) | Commands |
+|------|----------------|----------|
+| `terraformPlan` | `hashicorp/terraform:1.17.2` | `terraform init -backend=true -no-color -input=false` · `terraform plan -no-color -input=false -lock=true -detailed-exitcode -out=ci-<env>.tfplan` (workdir = the root) |
+
+### Gating
+
+The stage runs only when **both** conditions hold: `terraformPlan` is enabled
+**and** `env.BRANCH_NAME` belongs to `terraformPlanBranches` (default
+`['dev']`). PR builds (`PR-*`) and every other branch never reach the stage, so
+the AWS credential is never handed to code that comes from a pull request.
+
+### Credentials
+
+`aws-terraform-credentials` (username = Access Key ID, password = Secret Access
+Key) is bound with `withCredentials()` **only** around `init` and `plan`, and the
+values are passed to `runInContainer` **by name** (`envVars: [...]`), which
+expands them to `-e <name>`: no value reaches a command line or the build log,
+and nothing outside that block can read them. The non-secret environment
+(`AWS_DEFAULT_REGION`, `TF_IN_AUTOMATION=1`, `TF_INPUT=0`,
+`TF_PLUGIN_CACHE_DIR`) is scoped with `withEnv`.
+
+### Exit codes (`-detailed-exitcode`)
+
+| Code | Meaning | Result |
+|------|---------|--------|
+| `0` | plan OK, no changes | stage passes (`changes: false`) |
+| `2` | plan OK, changes pending | stage passes (`changes: true`) |
+| `1` | error (backend, provider, `AccessDenied`, ...) | stage fails |
+
+On `AccessDenied` the failure message asks to **record the action and the
+resource involved**: the IAM policies are never widened to make a build pass.
+
+### The plan file
+
+- Lives at `<root>/ci-<env>.tfplan` (e.g. `infra/terraform/envs/dev/ci-dev.tfplan`).
+- It is **not archived**: it must not be downloadable, only reviewable in the
+  workspace of the same build (a future apply phase reads it from there).
+- The extension is ignored by `.gitignore` (`*.tfplan`), so it can never be committed.
+- The plan of a previous build is deleted (`rm -f`) before the run, so an old
+  plan can never be reused.
+
+### Reuse and guards
+
+- Free space is checked **before** any Terraform command and **before** the
+  credential is bound, reusing the parser of `terraformValidate`
+  (`terraformValidate.freeSpaceMB`) and the threshold `terraformMinFreeSpaceMB`
+  (1500 MB by default).
+- The plugin cache is the same directory (`<workspace>/.terraform-plugin-cache`,
+  `/ws/.terraform-plugin-cache` inside the container), so the ~772 MB provider
+  downloaded by `init` is shared with the validate stage and never duplicated.
+- The root must exist and must declare its backend in `versions.tf`; the root
+  path is validated (relative, no `..`) because it is interpolated into a command.
+
+### Known limitations and follow-ups
+
+- **`required_version` discrepancy**: the three `versions.tf` declare
+  `>= 1.6.0` while their backends use `use_lockfile = true`, which requires
+  Terraform `>= 1.10`. The image is pinned to `1.17.2`, so the run works, but the
+  constraint does not enforce it. **Recommendation: raise `required_version` to
+  `>= 1.10` in `envs/{dev,stage,prod}/versions.tf`** — not changed in this phase.
+- **`disableConcurrentBuilds(abortPrevious: true)`**: a new build aborts the
+  previous one. For a future apply stage waiting on a manual `input`, an incoming
+  build cancels the pending approval (the apply then never runs — fail-safe, but
+  the approver must know it). To be decided before the apply phase.
+- **IAM permissions are not validated yet**: if the first real plan reports
+  `AccessDenied`, report the action and the resource. Known candidates from the
+  IAM simulation are `s3:ListBucket` without `s3:prefix`, `ec2:DescribeVolumes`,
+  `ec2:DescribeTags`, `ec2:DescribeVpcSecurityGroupRules` and
+  `dlm:GetLifecyclePolicies`. Never widen the policies from a build failure.
 
 ## Registering the library in Jenkins
 
