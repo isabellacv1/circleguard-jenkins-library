@@ -18,6 +18,12 @@
  * (overridable with `credentialId`); it is written to a temporary file by the
  * ssh-credentials plugin, so no ssh-agent plugin is required.
  *
+ * Secrets (passwords, JWT/QR/vault keys) are never in the repository. They come
+ * from the Jenkins "Secret file" credential `<environment>-app-secrets`
+ * (overridable with `secretsCredentialId`), a KEY=VALUE file appended to the
+ * generated .env. The secrets never pass through Groovy variables or the console
+ * log, and the local copy is deleted once it reaches the host (600 there).
+ *
  * Usage:
  *   def envCfg = deployEnvironment(environment: 'dev', version: '1.2.0-build.15.ab12cd3')
  *
@@ -27,6 +33,7 @@ def call(Map params = [:]) {
     String environment = params.environment ?: 'dev'
     String version = params.version
     String credentialId = params.credentialId ?: "${environment}-credential"
+    String secretsCredentialId = params.secretsCredentialId ?: "${environment}-app-secrets"
     String remoteDir = params.remoteDir ?: 'circleguard'
     String composeFiles = params.composeFiles ?: '-f docker-compose.dev.yml -f deploy/docker-compose.yml'
     String waitTimeout = "${params.waitTimeout ?: 600}"
@@ -71,14 +78,28 @@ def call(Map params = [:]) {
 
     withCredentials([sshUserPrivateKey(credentialsId: credentialId,
                                        usernameVariable: 'DEPLOY_SSH_USER',
-                                       keyFileVariable: 'DEPLOY_SSH_KEY')]) {
+                                       keyFileVariable: 'DEPLOY_SSH_KEY'),
+                     file(credentialsId: secretsCredentialId,
+                          variable: 'APP_SECRETS')]) {
         sh 'chmod 600 "$DEPLOY_SSH_KEY"'
 
         echo 'Copying the compose files to the host'
         sh "ssh ${opts} ${user}@${host} 'mkdir -p ${remoteDir}/deploy/environments'"
         sh "scp ${opts} docker-compose.dev.yml init-db.sql ${user}@${host}:${remoteDir}/"
         sh "scp ${opts} deploy/docker-compose.yml ${user}@${host}:${remoteDir}/deploy/"
-        sh "scp ${opts} deploy-env-remote.env ${user}@${host}:${remoteDir}/.env"
+        try {
+            // Append the secrets in the shell (single quotes: Groovy never sees
+            // them). tr drops the CR of files written on Windows, which would end
+            // up inside the passwords.
+            sh '''
+                chmod 600 deploy-env-remote.env
+                tr -d '\\r' < "$APP_SECRETS" >> deploy-env-remote.env
+            '''
+            sh "scp ${opts} deploy-env-remote.env ${user}@${host}:${remoteDir}/.env"
+        } finally {
+            sh 'rm -f deploy-env-remote.env'
+        }
+        sh "ssh ${opts} ${user}@${host} 'chmod 600 ${remoteDir}/.env'"
 
         echo 'Pulling the images and starting the stack (waits until healthy)'
         sh "ssh ${opts} ${user}@${host} " +
