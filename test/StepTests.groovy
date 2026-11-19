@@ -2190,6 +2190,13 @@ test('scans the local image through the socket and blocks HIGH/CRITICAL') {
     assert cmd.contains('-w /ws')
     assert !cmd.contains('/var/jenkins_home'): 'no host path may reach the container'
 
+    // The container keeps the agent uid/gid (asserted above) and receives the
+    // group that OWNS the socket as a supplementary group. The GID is resolved
+    // at run time with `stat` (never a fixed value): without it the daemon
+    // answers "permission denied while trying to connect to the docker API".
+    assert cmd.contains("--group-add \$(stat -c '%g' /var/run/docker.sock)"):
+        'the GID of the socket must be resolved at run time'
+
     // pinned tool image, blocking threshold, local-only resolution, shared cache.
     // `trivy image` has no --pull flag (0.76.2 fails with "unknown flag: --pull"):
     // the local daemon is selected with --image-src docker instead.

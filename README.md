@@ -391,15 +391,25 @@ circleguardPipeline(
 
 | Step | Image (pinned) | Command |
 |------|----------------|---------|
-| `trivyImageScan` | `aquasec/trivy:0.76.2` (the **tool**) | `docker run --rm … aquasec/trivy:0.76.2 image --severity HIGH,CRITICAL --exit-code 1 --pull never --format table --output trivy-image-report-<build>-<slug>.txt --cache-dir /ws/.trivy-cache [--ignorefile .trivyignore.yaml] <ref>` |
+| `trivyImageScan` | `aquasec/trivy:0.76.2` (the **tool**) | `docker run --rm --user $(id -u):$(id -g) --group-add $(stat -c '%g' /var/run/docker.sock) … aquasec/trivy:0.76.2 image --severity HIGH,CRITICAL --exit-code 1 --image-src docker --format table --output trivy-image-report-<build>-<slug>.txt --cache-dir /ws/.trivy-cache [--ignorefile .trivyignore.yaml] <ref>` |
 
 ### How the local image is read
 
 - The image is tagged in the Docker daemon of the host
   (`localhost:8082/<name>:<version>`), so the container talks to the daemon
-  through a **bind mount of `/var/run/docker.sock`**, and `--pull never` stops
-  Trivy from reaching `localhost:8082` from inside the container (where
-  `localhost` would be the container itself).
+  through a **bind mount of `/var/run/docker.sock`** and reads the image **only
+  from that local daemon** with `--image-src docker` (`trivy image` has no
+  `--pull` flag: 0.76.2 rejects it with *"unknown flag: --pull"*), so it never
+  reaches `localhost:8082` from inside the container (where `localhost` would be
+  the container itself) nor any registry.
+- The container runs with the uid/gid of the agent (`--user $(id -u):$(id -g)`),
+  which is **not** the group that owns the socket (and Docker does not resolve
+  supplementary groups for a numeric user), so the GID of the socket is read
+  **at run time** with `stat -c '%g'` — never a fixed value, it differs per
+  installation — and passed with `--group-add`. Without it the daemon answers
+  *"permission denied while trying to connect to the docker API"*; if the GID
+  cannot be read, `docker run` fails and the step fails closed instead of
+  scanning without the group.
 - The workspace is mounted with the same `volume-subpath` pattern as
   `runInContainer`, so the report lands in the workspace of the job and the
   container never reaches `credentials.xml`, `secrets/` or another job's
@@ -442,9 +452,11 @@ circleguardPipeline(
 
 ### Known limitations and follow-ups
 
-- **`--pull never` has not been executed in this environment**: confirm it in the
-  first real build (`trivy image --help`). If it were unsupported the failure is
-  visible, and the fallback is `docker save` + `trivy image --input`.
+- **`--image-src docker` and the dynamic `--group-add` have not been executed in
+  this environment**: confirm both in the first real build (a socket permission
+  problem shows up as *"permission denied while trying to connect to the docker
+  API"*). If the socket cannot be used at all, the fallback is `docker save` +
+  `trivy image --input`.
 - **The Docker socket is mounted into the pinned Trivy container** for the
   duration of the scan (root-equivalent on the host). Mitigations: the tool image
   is pinned (never `latest`) and the container is `--rm`.

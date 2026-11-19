@@ -16,6 +16,13 @@
  *     `localhost:8082` from inside the container (where `localhost` would be
  *     the container itself) nor to reach any registry. (`trivy image` has no
  *     `--pull` flag: 0.76.2 rejects it with *"unknown flag: --pull"*);
+ *   - the container runs with the uid/gid of the agent (`--user $(id -u):$(id -g)`),
+ *     which is NOT the group that owns the socket (and Docker does not resolve
+ *     supplementary groups for a numeric user), so the GID of the socket is read
+ *     **at run time** with `stat -c '%g'` — never a fixed value, it differs per
+ *     installation — and passed with `--group-add`. Without it the daemon answers
+ *     *"permission denied while trying to connect to the docker API"*; if the GID
+ *     cannot be read the command fails, so the step never scans without it;
  *   - the workspace is mounted with the same `volume-subpath` pattern as
  *     runInContainer, so the report is written into the workspace of the job (and
  *     archived by Jenkins) while the container never reaches `credentials.xml`,
@@ -103,9 +110,21 @@ def call(Map params = [:]) {
 
     String ignore = (ignoreFile && fileExists(ignoreFile)) ? " --ignorefile ${ignoreFile}" : ''
     String mountSpec = "type=volume,source=${volume},destination=/ws,volume-subpath=${subPath}"
-    String socketSpec = 'type=bind,source=/var/run/docker.sock,destination=/var/run/docker.sock'
+    // Single source of truth for the socket: the bind mount and the group lookup
+    // below must always refer to the same file.
+    String socketPath = '/var/run/docker.sock'
+    String socketSpec = "type=bind,source=${socketPath},destination=${socketPath}"
 
-    String command = "docker run --rm --user \$(id -u):\$(id -g) -e HOME=/tmp " +
+    // The container runs with the uid/gid of the agent (`--user`), which is NOT
+    // the group that owns the socket: `--user <uid>:<gid>` sets a single numeric
+    // group and Docker cannot resolve supplementary groups for an unknown uid.
+    // The GID of the socket is read on the host at run time (never assumed: it
+    // differs per installation) and passed with --group-add. The shell expands
+    // $(stat …) BEFORE docker run: if the GID cannot be read the arguments are
+    // malformed, docker run fails and the step fails closed instead of scanning
+    // without the supplementary group.
+    String command = "docker run --rm --user \$(id -u):\$(id -g) " +
+                     "--group-add \$(stat -c '%g' ${socketPath}) -e HOME=/tmp " +
                      "--mount '${mountSpec}' --mount '${socketSpec}' " +
                      "-w /ws ${toolImage} image " +
                      "--severity ${severity} --exit-code 1 --image-src docker " +
