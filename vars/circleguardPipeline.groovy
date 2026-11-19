@@ -43,6 +43,8 @@ def call(Map rawConfig = [:]) {
         stages {
             stage('Checkout') {
                 steps {
+                    // Declarative: declarations and conditionals must live inside
+                    // `script {}`, otherwise the parser fails with "Expected a step".
                     // With skipDefaultCheckout() the Git plugin does not publish the
                     // GIT_* variables to env (JENKINS-66803): the checkout step
                     // returns them in its map instead. Publish the revision that was
@@ -51,12 +53,14 @@ def call(Map rawConfig = [:]) {
                     // the plan and terraformApply/terraformApproval verify it. If the
                     // checkout does not return it, it stays unset and those steps fail
                     // closed instead of comparing a fabricated commit.
-                    Map scmVars = checkout scm
-                    if (!env.GIT_COMMIT && scmVars?.GIT_COMMIT) {
-                        env.GIT_COMMIT = scmVars.GIT_COMMIT
-                    }
-                    if (!env.GIT_BRANCH && scmVars?.GIT_BRANCH) {
-                        env.GIT_BRANCH = scmVars.GIT_BRANCH
+                    script {
+                        Map scmVars = checkout scm
+                        if (!env.GIT_COMMIT && scmVars?.GIT_COMMIT) {
+                            env.GIT_COMMIT = scmVars.GIT_COMMIT
+                        }
+                        if (!env.GIT_BRANCH && scmVars?.GIT_BRANCH) {
+                            env.GIT_BRANCH = scmVars.GIT_BRANCH
+                        }
                     }
                     sh 'git log -1 --format="%h %an: %s"'
                 }
