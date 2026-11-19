@@ -106,6 +106,16 @@ def call(Map params = [:]) {
               "the backend of ${root} cannot be initialised"
     }
 
+    // The sidecar must record the commit that produced this plan: neither
+    // terraformApply nor terraformApproval can verify the provenance without it.
+    // Fail HERE, before any Terraform command and before the sidecar exists,
+    // instead of leaving behind a plan that could only fail later. No fallback
+    // and no default value: an unrecordable provenance must never succeed.
+    if (!env.GIT_COMMIT) {
+        error 'terraformPlan: GIT_COMMIT is not available: the provenance of ' +
+              'the plan cannot be recorded, aborting before running Terraform'
+    }
+
     // Default plan name: ci-<env>-b<build>.tfplan (e.g. infra/terraform/envs/dev
     // in build 47 -> ci-dev-b47.tfplan), always inside the root and always with
     // the extension ignored by .gitignore (`*.tfplan`). The build number is part
@@ -226,7 +236,7 @@ def call(Map params = [:]) {
     String createdAt = java.time.Instant.now().toString()
     writeFile file: infoPath,
               text: "build=${build}\n" +
-                    "commit=${env.GIT_COMMIT ?: 'unknown'}\n" +
+                    "commit=${env.GIT_COMMIT}\n" +
                     "root=${root}\n" +
                     "changes=${status == 2}\n" +
                     "status=${status}\n" +

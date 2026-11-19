@@ -837,6 +837,36 @@ test('rejects an unsafe root, a plan name without .tfplan and an empty credentia
     assert noCredential.sh.isEmpty(): 'nothing must run without a credential id'
 }
 
+test('refuses to produce a plan whose provenance commit is unavailable') {
+    // GIT_COMMIT is the only source of the commit recorded in the sidecar: when
+    // it is missing the step must stop BEFORE any command, leaving no sidecar and
+    // binding no credential (the old `commit=unknown` fallback is gone).
+    def h = newStep('terraformPlan', [env: [WORKSPACE   : '/var/jenkins_home/workspace/circleguard_dev',
+                                            BUILD_NUMBER: '42']])
+    try {
+        h.script.call(root: 'infra/terraform/envs/dev')
+        assert false: 'a plan without GIT_COMMIT must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('GIT_COMMIT is not available'): e.message
+        assert e.message.contains('provenance'): e.message
+    }
+    assert h.sh.isEmpty(): 'nothing must run before the provenance is available'
+    assert h.written.isEmpty(): 'no sidecar without a recordable commit'
+    assert h.withCredentials.isEmpty(): 'no credential must be bound'
+}
+
+test('records the real commit in the sidecar and never falls back to unknown (source level)') {
+    String step = new File(root, 'vars/terraformPlan.groovy').text
+    assert step.contains('if (!env.GIT_COMMIT)'): 'the provenance must be validated'
+    assert step.contains('GIT_COMMIT is not available'): 'the failure must be explicit'
+    assert !step.contains("?: 'unknown'"): 'the fallback must be removed'
+    assert step.contains('commit=${env.GIT_COMMIT}'): 'the sidecar must record the real commit'
+    // the guard runs before the sidecar exists, so no plan can end successfully
+    // without a verifiable provenance
+    assert step.indexOf('GIT_COMMIT is not available') < step.indexOf('writeFile file: infoPath'):
+        'the provenance must be checked before the sidecar is written'
+}
+
 test('never runs apply and never archives the plan (source level)') {
     String step = new File(root, 'vars/terraformPlan.groovy').text
     assert !step.contains('apply -no-color'): 'the plan step must never apply'
@@ -2697,6 +2727,30 @@ test('declares the Terraform plan stage between Trivy and Publish, gated to dev'
     assert block.contains('region: cfg.terraformAwsRegion')
     assert block.contains('minFreeSpaceMB: cfg.terraformMinFreeSpaceMB')
     assert !block.contains('terraformApply('): 'the plan stages must not run apply'
+}
+
+test('captures the checkout result and publishes the commit before the plan (source level)') {
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+
+    int checkout = text.indexOf('Map scmVars = checkout scm')
+    assert checkout > 0: 'the return value of the checkout must be captured'
+    assert text.count('checkout scm') == 1: 'exactly one checkout, never a second one'
+
+    int publish = text.indexOf('env.GIT_COMMIT = scmVars.GIT_COMMIT')
+    assert publish > checkout: 'the commit must be published after the checkout'
+    assert publish < text.indexOf("stage('Terraform plan')"):
+        'the commit must reach env before the plan stage runs'
+
+    // Published only when absent: an existing value is never overwritten, and no
+    // SHA is ever fabricated (the value is the one the checkout returned).
+    assert text.contains('if (!env.GIT_COMMIT && scmVars?.GIT_COMMIT)'):
+        'an existing commit must never be overwritten'
+    assert text.contains('if (!env.GIT_BRANCH && scmVars?.GIT_BRANCH)'):
+        'an existing branch must never be overwritten'
+    assert !text.contains("GIT_COMMIT = '") && !text.contains('GIT_COMMIT = "'):
+        'no default or made-up commit is ever assigned'
+    assert text.contains('skipDefaultCheckout()'): 'the checkout option must be kept'
+    assert text.contains("sh 'git log -1"): 'the git log of the checkout must be kept'
 }
 
 test('passes the Trivy Image configuration to publishImages') {
