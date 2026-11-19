@@ -2190,9 +2190,12 @@ test('scans the local image through the socket and blocks HIGH/CRITICAL') {
     assert cmd.contains('-w /ws')
     assert !cmd.contains('/var/jenkins_home'): 'no host path may reach the container'
 
-    // pinned tool image, blocking threshold, local-only resolution, shared cache
+    // pinned tool image, blocking threshold, local-only resolution, shared cache.
+    // `trivy image` has no --pull flag (0.76.2 fails with "unknown flag: --pull"):
+    // the local daemon is selected with --image-src docker instead.
     assert cmd.contains('aquasec/trivy:0.76.2 image --severity HIGH,CRITICAL ' +
-                        '--exit-code 1 --pull never')
+                        '--exit-code 1 --image-src docker')
+    assert !cmd.contains('--pull'): 'the unsupported --pull flag must be gone'
     assert cmd.contains("--format table --output ${IMG_REPORT} --cache-dir /ws/.trivy-cache --quiet")
     assert cmd.contains('--ignorefile .trivyignore.yaml')
     assert cmd.endsWith(" ${IMG_REF}"): cmd

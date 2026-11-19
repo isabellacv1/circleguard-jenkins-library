@@ -11,9 +11,11 @@
  *
  *   - the image is tagged in the Docker daemon of the host
  *     (`localhost:8082/<name>:<version>`), so the container talks to the daemon
- *     through a bind mount of /var/run/docker.sock and `--pull never` stops
- *     Trivy from trying to reach `localhost:8082` from inside the container,
- *     where `localhost` would be the container itself;
+ *     through a bind mount of /var/run/docker.sock and `--image-src docker`
+ *     restricts Trivy to that local daemon: it never tries to pull
+ *     `localhost:8082` from inside the container (where `localhost` would be
+ *     the container itself) nor to reach any registry. (`trivy image` has no
+ *     `--pull` flag: 0.76.2 rejects it with *"unknown flag: --pull"*);
  *   - the workspace is mounted with the same `volume-subpath` pattern as
  *     runInContainer, so the report is written into the workspace of the job (and
  *     archived by Jenkins) while the container never reaches `credentials.xml`,
@@ -106,7 +108,7 @@ def call(Map params = [:]) {
     String command = "docker run --rm --user \$(id -u):\$(id -g) -e HOME=/tmp " +
                      "--mount '${mountSpec}' --mount '${socketSpec}' " +
                      "-w /ws ${toolImage} image " +
-                     "--severity ${severity} --exit-code 1 --pull never " +
+                     "--severity ${severity} --exit-code 1 --image-src docker " +
                      "--format table --output ${report} --cache-dir ${cacheDir} --quiet" +
                      ignore + " ${ref}"
 
