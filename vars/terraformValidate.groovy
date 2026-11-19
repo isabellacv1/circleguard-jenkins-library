@@ -5,13 +5,20 @@
  *
  *   0. free-space check of the workspace (ABORTS before running Terraform)
  *   1. terraform fmt  -check -recursive -no-color <fmtPath>   (never writes)
- *   2. terraform init -backend=false -no-color                (per root)
- *   3. terraform validate -no-color                           (per root)
+ *   2. terraform init -backend=false -no-color                (per root, own TF_DATA_DIR)
+ *   3. terraform validate -no-color                           (per root, same TF_DATA_DIR)
  *
  * Guarantees:
  *   - No AWS credentials are needed: `-backend=false` never contacts S3 and
  *     `validate` only evaluates the configuration.
  *   - No state is read, written or migrated.
+ *   - Isolated data dir (`TF_DATA_DIR`): the workspace persists between builds,
+ *     so `<root>/.terraform/terraform.tfstate` may already record the S3
+ *     backend configured by a previous plan/apply, and resolving it makes
+ *     `init -backend=false` fail here (this container has no AWS credentials
+ *     and no role in IMDS). Every root therefore validates in its own
+ *     `<workspace>/.terraform-validate/<root>`, used by BOTH `init` and
+ *     `validate`, so the `.terraform` of the root is never read nor written.
  *   - No `plan`, `apply` or `destroy` is ever executed.
  *   - No `.tf` file is modified: `fmt` runs with `-check` (a file that needs
  *     formatting fails the build instead of being rewritten).
@@ -27,11 +34,14 @@
  * Plugin cache (documented behaviour, HashiCorp docs "plugin_cache_dir"):
  *   - `terraform init` checks the cache first; if the plugin is there it is
  *     reused, otherwise it is downloaded into the cache and then linked from
- *     `.terraform/providers/...` ("Terraform will use symbolic links to avoid
- *     storing a separate copy of a cached plugin in multiple directories").
- *   - What stays in `.terraform`: the `providers/` entries (symlinks to the
- *     cache), `modules/modules.json` (the modules of this project are local, so
- *     nothing is copied) and the `environment` marker. No state.
+ *     `providers/...` of the data dir (`TF_DATA_DIR`, see the isolation note
+ *     above) ("Terraform will use symbolic links to avoid storing a separate
+ *     copy of a cached plugin in multiple directories").
+ *   - What stays in the data dir of the root (`TF_DATA_DIR`): the `providers/`
+ *     entries (symlinks to the cache), `modules/modules.json` (the modules of
+ *     this project are local, so nothing is copied) and the `environment`
+ *     marker. No state, and the `.terraform` of the root keeps whatever the
+ *     plan/apply stages left there.
  *   - Expected disk with the cache: ~772 MB in `<workspace>/.terraform-plugin-cache`
  *     plus a few KB per root, instead of 772 MB per root.
  *   - The cache lives in the workspace of the job: persistent for dev/main and
@@ -91,6 +101,11 @@ def call(Map params = [:]) {
     sh "mkdir -p \"${env.WORKSPACE}/${pluginCacheName}\""
     String pluginCache = "/ws/${pluginCacheName}"
 
+    // Base of the isolated Terraform data dirs: <workspace>/.terraform-validate/<root>.
+    // It lives OUTSIDE the root, so the `.terraform` written by plan/apply keeps
+    // its own metadata and this step neither reads nor writes it.
+    String dataDirBase = '.terraform-validate'
+
     echo "Terraform validation with ${image}"
 
     // fmt -check never writes: it only fails when a file is not formatted.
@@ -100,22 +115,35 @@ def call(Map params = [:]) {
                    timeout: timeoutMinutes)
 
     for (String root : roots) {
+        // One data dir per root (two roots can never share it) and the SAME value
+        // for init and validate, so validate finds what init installed. The value
+        // is passed by NAME through envVars (it never reaches the command line or
+        // the build log) and scoped with withEnv, like TF_PLUGIN_CACHE_DIR.
+        String dataDirRel = "${dataDirBase}/${root}"
+        String dataDir = "/ws/${dataDirRel}"
+        sh "mkdir -p \"${env.WORKSPACE}/${dataDirRel}\""
+
         // -backend=false: the providers are installed locally, S3 is never touched.
-        // TF_PLUGIN_CACHE_DIR reuses the already downloaded provider.
+        // TF_PLUGIN_CACHE_DIR reuses the already downloaded provider (shared by
+        // every root, unchanged); TF_DATA_DIR keeps this init away from the
+        // backend metadata of plan/apply.
         echo "terraform init -backend=false -> ${root}"
-        withEnv(["TF_PLUGIN_CACHE_DIR=${pluginCache}"]) {
+        withEnv(["TF_PLUGIN_CACHE_DIR=${pluginCache}", "TF_DATA_DIR=${dataDir}"]) {
             runInContainer(image: image,
                            workDir: root,
                            command: 'init -backend=false -no-color',
-                           envVars: ['TF_PLUGIN_CACHE_DIR'],
+                           envVars: ['TF_PLUGIN_CACHE_DIR', 'TF_DATA_DIR'],
                            timeout: timeoutMinutes)
         }
 
         echo "terraform validate -> ${root}"
-        runInContainer(image: image,
-                       workDir: root,
-                       command: 'validate -no-color',
-                       timeout: timeoutMinutes)
+        withEnv(["TF_DATA_DIR=${dataDir}"]) {
+            runInContainer(image: image,
+                           workDir: root,
+                           command: 'validate -no-color',
+                           envVars: ['TF_DATA_DIR'],
+                           timeout: timeoutMinutes)
+        }
     }
 
     echo "Terraform validation OK (${roots.size()} root(s): ${roots.join(', ')})"

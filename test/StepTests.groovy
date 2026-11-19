@@ -369,22 +369,27 @@ test('returns the exit status when returnStatus is requested') {
 }
 
 println 'terraformValidate'
-test('checks the disk, creates the plugin cache and runs fmt/init/validate, and nothing else') {
+test('checks the disk, creates the plugin cache and the data dirs, and runs fmt/init/validate, and nothing else') {
     def h = newStep('terraformValidate')
     h.script.call(roots: ['infra/terraform/envs/dev'], fmtPath: 'infra/terraform')
 
-    // df (free space) + mkdir (plugin cache) + 3 docker runs
-    assert h.sh.size() == 5: "expected 5 commands, got ${h.sh.size()}"
+    // df (free space) + mkdir (plugin cache) + fmt + mkdir (data dir) + init + validate
+    assert h.sh.size() == 6: "expected 6 commands, got ${h.sh.size()}"
     assert h.sh[0].startsWith('df -Pk'): 'the disk must be checked first'
     assert h.sh[1].contains('.terraform-plugin-cache'): 'the plugin cache must be created'
     assert h.sh[1].contains('/var/jenkins_home/workspace/circleguard_dev/')
 
     assert h.sh[2].contains(' fmt -check -recursive -no-color infra/terraform')
-    assert h.sh[3].contains(' init -backend=false -no-color')
-    assert h.sh[3].contains("-w '/ws/infra/terraform/envs/dev'")
-    assert h.sh[3].contains('-e TF_PLUGIN_CACHE_DIR')
-    assert h.sh[4].contains(' validate -no-color')
+    // the isolated data dir is created on the controller, outside the root
+    assert h.sh[3].startsWith('mkdir -p'): 'the data dir must be created'
+    assert h.sh[3].contains('.terraform-validate/infra/terraform/envs/dev')
+    assert h.sh[4].contains(' init -backend=false -no-color')
     assert h.sh[4].contains("-w '/ws/infra/terraform/envs/dev'")
+    assert h.sh[4].contains('-e TF_PLUGIN_CACHE_DIR')
+    assert h.sh[4].contains('-e TF_DATA_DIR')
+    assert h.sh[5].contains(' validate -no-color')
+    assert h.sh[5].contains("-w '/ws/infra/terraform/envs/dev'")
+    assert h.sh[5].contains('-e TF_DATA_DIR')
 
     // no terraform command may run before the disk check
     assert !h.sh[0].contains('docker run')
@@ -396,17 +401,21 @@ test('checks the disk, creates the plugin cache and runs fmt/init/validate, and 
         assert !cmd.contains('-upgrade'): "the lockfile must not be upgraded: ${cmd}"
         assert !cmd.contains('-e AWS_'): "no AWS credentials are needed: ${cmd}"
         assert !cmd.contains('-var '): "variables are never injected: ${cmd}"
-        // the cache path is passed by NAME, its value never reaches the command line
+        // the cache and the data dir are passed by NAME, their value never reaches the command line
         assert !cmd.contains('TF_PLUGIN_CACHE_DIR=/'): "the value must not be in the command: ${cmd}"
+        assert !cmd.contains('TF_DATA_DIR=/'): "the value must not be in the command: ${cmd}"
     }
     assert h.sh.count { it.contains('-backend=false') } == 1
 }
 
-test('passes TF_PLUGIN_CACHE_DIR scoped with withEnv') {
+test('passes TF_PLUGIN_CACHE_DIR and TF_DATA_DIR scoped with withEnv') {
     def h = newStep('terraformValidate')
     h.script.call(roots: ['infra/terraform/envs/dev'], fmtPath: 'infra/terraform')
-    assert h.withEnv.size() == 1: 'the cache variable must be scoped to the init step'
-    assert h.withEnv.flatten().contains('TF_PLUGIN_CACHE_DIR=/ws/.terraform-plugin-cache')
+    // init (cache + data dir) and validate (data dir only), both scoped
+    assert h.withEnv.size() == 2: 'both terraform commands must be scoped'
+    assert h.withEnv[0].contains('TF_PLUGIN_CACHE_DIR=/ws/.terraform-plugin-cache')
+    assert h.withEnv[0].contains('TF_DATA_DIR=/ws/.terraform-validate/infra/terraform/envs/dev')
+    assert h.withEnv[1] == ['TF_DATA_DIR=/ws/.terraform-validate/infra/terraform/envs/dev']
 }
 
 test('aborts before running Terraform when the disk is full') {
@@ -430,12 +439,57 @@ test('validates every configured root') {
     h.script.call(roots: ['infra/terraform/envs/dev', 'infra/terraform/envs/stage',
                           'infra/terraform/envs/prod', 'infra/terraform/backend-bootstrap'],
                   fmtPath: 'infra/terraform')
-    // df + mkdir + fmt + (init + validate) * 4
-    assert h.sh.size() == 11
+    // df + mkdir (cache) + fmt + (mkdir (data dir) + init + validate) * 4
+    assert h.sh.size() == 15
     assert h.sh.count { it.contains(' fmt -check ') } == 1
     assert h.sh.count { it.contains(' init -backend=false ') } == 4
     assert h.sh.count { it.contains(' validate ') } == 4
-    assert h.withEnv.size() == 4: 'every init must receive the plugin cache'
+    assert h.sh.count { it.startsWith('mkdir -p') } == 5: 'the cache plus one data dir per root'
+    assert h.withEnv.size() == 8: 'init and validate of every root must be scoped'
+}
+
+test('gives init and validate the same TF_DATA_DIR, and a different one per root') {
+    def h = newStep('terraformValidate')
+    h.script.call(roots: ['infra/terraform/envs/dev', 'infra/terraform/envs/stage'],
+                  fmtPath: 'infra/terraform')
+
+    String dev = '/ws/.terraform-validate/infra/terraform/envs/dev'
+    String stage = '/ws/.terraform-validate/infra/terraform/envs/stage'
+
+    // Both commands of a root receive the same value, and two roots never share it.
+    List<String> scoped = h.withEnv.flatten().findAll { it.toString().startsWith('TF_DATA_DIR=') }
+    assert scoped == ['TF_DATA_DIR=' + dev, 'TF_DATA_DIR=' + dev,
+                      'TF_DATA_DIR=' + stage, 'TF_DATA_DIR=' + stage]: "${scoped}"
+
+    String initDev = h.sh.find { it.contains(' init -backend=false ') &&
+                                 it.contains("-w '/ws/infra/terraform/envs/dev'") }
+    String validateDev = h.sh.find { it.contains(' validate -no-color') &&
+                                     it.contains("-w '/ws/infra/terraform/envs/dev'") }
+    assert initDev && validateDev: 'both commands of the root must run'
+    assert initDev.contains('-e TF_PLUGIN_CACHE_DIR -e TF_DATA_DIR'): initDev
+    assert validateDev.contains('-e TF_DATA_DIR'): validateDev
+    // The value is passed by NAME only, so it never reaches the command line or the log.
+    assert !initDev.contains('TF_DATA_DIR=/'): 'the value must not be in the command'
+    assert !validateDev.contains('TF_DATA_DIR=/'): 'the value must not be in the command'
+    // The plugin cache stays shared (same value for every root) and only in init.
+    assert h.withEnv.flatten().count { it.toString() == 'TF_PLUGIN_CACHE_DIR=/ws/.terraform-plugin-cache' } == 2
+    assert !validateDev.contains('-e TF_PLUGIN_CACHE_DIR'): 'validate keeps its previous environment'
+    // No AWS credential is ever passed to the validation container.
+    assert !initDev.contains('-e AWS_') && !validateDev.contains('-e AWS_')
+}
+
+test('never reads nor writes the .terraform left by plan/apply in the root') {
+    def h = newStep('terraformValidate')
+    h.script.call(roots: ['infra/terraform/envs/dev'], fmtPath: 'infra/terraform')
+
+    h.sh.each { String cmd ->
+        assert !cmd.contains('envs/dev/.terraform'): "the .terraform of the root must not be touched: ${cmd}"
+        assert !cmd.contains('rm -rf'): "nothing may be deleted: ${cmd}"
+    }
+    // The data dir is created outside the root, under the workspace.
+    String mkdirData = h.sh.find { it.startsWith('mkdir -p') && it.contains('.terraform-validate') }
+    assert mkdirData == 'mkdir -p ' +
+        '"/var/jenkins_home/workspace/circleguard_dev/.terraform-validate/infra/terraform/envs/dev"'
 }
 
 test('rejects an empty root list and a missing root') {

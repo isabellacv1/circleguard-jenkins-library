@@ -184,6 +184,14 @@ Rules enforced by the steps:
   `trivyScan`, and `terraformValidate` runs `init` with `-backend=false`, so the
   S3 backend is never contacted and no state is migrated. (The separate
   `Terraform plan` stage described below is the only one that contacts S3.)
+- **The Terraform data is isolated per root**: `terraformValidate` runs `init`
+  and `validate` with `TF_DATA_DIR=<workspace>/.terraform-validate/<root>`
+  (passed by name through `runInContainer`, scoped with `withEnv`), so the
+  `.terraform` written by the plan/apply stages — which records the S3 backend
+  in `.terraform/terraform.tfstate` — is never read nor written, and
+  `init -backend=false` cannot try to resolve that backend without credentials.
+  Two roots never share a data dir, `TF_PLUGIN_CACHE_DIR` stays shared, and the
+  `.terraform` of the root is left exactly as plan/apply left it.
 - **No `.tf` file is modified**: `fmt` runs with `-check` (a badly formatted file
   fails the build instead of being rewritten) and `init` never uses `-upgrade`, so
   `.terraform.lock.hcl` is not rewritten.
@@ -206,11 +214,13 @@ Rules enforced by the steps:
 - **The AWS provider is downloaded once**: `TF_PLUGIN_CACHE_DIR` points to
   `<workspace>/.terraform-plugin-cache` (persistent for dev/main, isolated per
   job). Terraform downloads the ~772 MB provider there once and **links** it into
-  `.terraform/providers/...` of each root ("Terraform will use symbolic links to
-  avoid storing a separate copy of a cached plugin in multiple directories").
-  What stays in `.terraform`: those links, `modules/modules.json` (the modules of
-  this project are local) and the `environment` marker — no state. Expected disk:
-  ~772 MB in the cache plus a few KB per root, instead of 772 MB per root.
+  the data dir of each root (`.terraform-validate/<root>/providers/...`,
+  "Terraform will use symbolic links to avoid storing a separate copy of a
+  cached plugin in multiple directories"). What stays there: those links,
+  `modules/modules.json` (the modules of this project are local) and the
+  `environment` marker — no state, and the `.terraform` of the root is left
+  untouched. Expected disk: ~772 MB in the cache plus a few KB per root,
+  instead of 772 MB per root.
 
 ### Exclusions
 
