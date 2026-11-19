@@ -56,8 +56,10 @@
  *                 image: 'hashicorp/terraform:1.17.2',
  *                 region: 'us-east-1')
  *
- * Returns [root: ..., planFile: ..., planInfo: ..., changes: true|false,
- * status: 0|2].
+ * Returns [root: ..., planFile: ..., planInfo: ..., sha256: <64 hex chars>,
+ * changes: true|false, status: 0|2]. The `sha256` is exactly the one written in
+ * the sidecar; the pipeline publishes it as `env.TF_PLAN_SHA256` so a future
+ * approval (E4) can bind to it. The other fields are unchanged.
  * Raises `error` when the plan fails or the plan file was not written.
  */
 def call(Map params = [:]) {
@@ -234,6 +236,7 @@ def call(Map params = [:]) {
     return [root    : root,
             planFile: planPath,
             planInfo: infoPath,
+            sha256  : planHash,
             changes : status == 2,
             status  : status]
 }

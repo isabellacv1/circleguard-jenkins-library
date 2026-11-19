@@ -16,6 +16,23 @@
  *   8. the plan file and the `<plan>.info` sidecar exist
  *   9. the `<plan>.applied` marker does NOT exist (never apply twice)
  *
+ * When the target requires an approval (`requireApproval: true`, the PROD
+ * switch wired by the pipeline in a later step), ALL of these are also verified
+ * BEFORE `withCredentials`, `terraform init` and `terraform apply`:
+ *
+ *  10. TF_APPROVED_BY / TF_APPROVED_AT / TF_APPROVED_PLAN_SHA /
+ *      TF_APPROVED_BUILD exist, the approver is not empty and the approval date
+ *      is valid and not in the future
+ *  11. TF_APPROVED_BUILD equals BUILD_NUMBER, and TF_APPROVED_PLAN_SHA equals
+ *      TF_PLAN_SHA256, which equals the sidecar sha256, which equals the
+ *      sha256 recomputed from the plan file
+ *  12. the plan still has changes, its `createdAt` is valid, not in the future
+ *      and not older than `maxAgeMinutes` (default 60 =
+ *      terraformApprovalMaxAgeMinutes), and the approval itself is not older
+ *      than that same window
+ *
+ * DEV never sets `requireApproval`, so its behaviour is byte for byte the same.
+ *
  * When the plan reported no changes the step registers `SKIPPED_NO_CHANGES` and
  * omits init and apply entirely (no AWS call, no lock).
  *
@@ -72,6 +89,15 @@ def call(Map params = [:]) {
     int minFreeSpaceMB = params.minFreeSpaceMB ?: 1500
     String pluginCacheName = params.pluginCacheDir ?: '.terraform-plugin-cache'
     String planFile = params.planFile
+    // Approval gate (E4, S4). DEV never sets it, so its behaviour is unchanged;
+    // a target that requires an approval (PROD, wired in a later step) must have
+    // a valid approval of THIS plan before anything talks to AWS.
+    boolean requireApproval = params.requireApproval ?: false
+    // Validity window of the plan AND of its approval. There is no dedicated
+    // setting for it, so this reuses terraformApprovalMaxAgeMinutes (60): one
+    // window keeps one rule, and the plan age is always the dominant constraint
+    // because an approval is produced after the plan.
+    int maxAgeMinutes = params.maxAgeMinutes ?: 60
 
     // ---------------------------------------------------------------- guards
     if (!root) {
@@ -198,6 +224,14 @@ def call(Map params = [:]) {
               "('${info.sha256}'): refusing to apply"
     }
 
+    // Approval gate, part 1: an approval-gated target must have something to
+    // approve. It runs BEFORE the SKIPPED path below, which stays untouched for
+    // DEV (a target without approval and without changes still skips cleanly).
+    if (requireApproval && changes != 'true') {
+        error "terraformApply: the plan of ${root} has no changes: " +
+              'there is nothing to approve'
+    }
+
     String envName = root.tokenize('/').last()
     String evidence = "${root}/terraform-apply-${envName}-b${build}.txt"
     // java.time instead of Date.format(String, TimeZone): available in every
@@ -244,6 +278,20 @@ def call(Map params = [:]) {
               "sidecar records ${info.sha256}: the plan changed after it was produced"
     }
     echo "terraformApply: plan hash verified (${planHash})"
+
+    // Approval gate, part 2: every value the approval must match, checked AFTER
+    // the plan hash and BEFORE mkdir, withCredentials, init and apply.
+    Map approval = null
+    if (requireApproval) {
+        long planAge = checkApproval(build, root, info, planHash, maxAgeMinutes)
+        approval = [approvedBy  : env.TF_APPROVED_BY,
+                    approvedAt  : env.TF_APPROVED_AT,
+                    approvedSha : env.TF_APPROVED_PLAN_SHA,
+                    approvedBuild: env.TF_APPROVED_BUILD,
+                    planAge     : planAge]
+        echo "terraformApply: approval verified (by ${env.TF_APPROVED_BY}, " +
+             "build ${env.TF_APPROVED_BUILD}, plan age ${planAge} min)"
+    }
 
     sh "mkdir -p \"${env.WORKSPACE}/${pluginCacheName}\""
     String pluginCache = "/ws/${pluginCacheName}"
@@ -309,7 +357,7 @@ def call(Map params = [:]) {
               'and the workspace first.'
     }
 
-    writeEvidence(evidence, build, root, planPath, changes, outcome, createdAt)
+    writeEvidence(evidence, build, root, planPath, changes, outcome, createdAt, approval)
 
     try {
         sh "rm -f \"${planPath}\" \"${infoPath}\""
@@ -325,12 +373,14 @@ def call(Map params = [:]) {
 
 /**
  * Writes and archives the evidence of this run. It only contains metadata
- * (build, branch, commit, root, plan, changes, outcome, date): never a credential
- * and never a Terraform output. A failure is reported explicitly and is NOT
- * retried.
+ * (build, branch, commit, root, plan, changes, outcome, date, and the approval
+ * when the target requires one): never a credential, never an environment
+ * secret and never a Terraform output. A failure is reported explicitly and is
+ * NOT retried.
  */
 void writeEvidence(String path, String build, String root, String planPath,
-                   String changes, String outcome, String createdAt) {
+                   String changes, String outcome, String createdAt,
+                   Map approval = null) {
     String text = """CircleGuard terraform apply record
 ================================
 Build       : ${build}
@@ -342,6 +392,13 @@ Changes     : ${changes}
 Outcome     : ${outcome}
 Date (UTC)  : ${createdAt}
 """
+    if (approval) {
+        text += "Approved by : ${approval.approvedBy}\n" +
+                "Approved at : ${approval.approvedAt}\n" +
+                "Approved sha: ${approval.approvedSha}\n" +
+                "Approved bld: ${approval.approvedBuild}\n" +
+                "Plan age    : ${approval.planAge} min at apply\n"
+    }
     // The two failures are reported differently: whether the evidence exists in
     // the workspace changes what the operator has to do next. Neither is retried.
     String tail = (outcome == 'APPLIED')
@@ -361,4 +418,123 @@ Date (UTC)  : ${createdAt}
         error "terraformApply: ${tail}the evidence WAS written in ${path} but could " +
               "NOT be archived (${e.message}). ${retry}"
     }
+}
+
+/**
+ * Verifies that the approval persisted by `terraformApproval` belongs to THIS
+ * plan and THIS build, that neither the plan nor the approval has expired, and
+ * that the approval does not predate the plan (createdAt <= approvedAt <= now;
+ * equality is allowed). Returns the age of the plan in minutes, used as evidence.
+ *
+ * Every check raises `error`, so it fails closed BEFORE withCredentials, before
+ * `terraform init` and before `terraform apply`. The sidecar build/commit/root
+ * and its status were already verified by the caller against this execution.
+ *
+ * The validity window reuses `terraformApprovalMaxAgeMinutes` (maxAgeMinutes)
+ * instead of a new setting: there is no dedicated parameter (and the
+ * configuration is out of scope for this step), one window keeps one rule to
+ * reason about, and because an approval is always produced AFTER the plan, the
+ * plan age is always the dominant constraint while the approval age adds
+ * protection against a tampered or stale TF_APPROVED_AT.
+ */
+long checkApproval(String build, String root, Map info, String planHash, int maxAgeMinutes) {
+    // 1) the four values written by terraformApproval must exist. `== null` (and
+    //    not `!value`) distinguishes "the approval stage never ran" from "it ran
+    //    but produced an empty value", which is diagnosed below.
+    if (env.TF_APPROVED_BY == null) {
+        error 'terraformApply: the target requires an approval but TF_APPROVED_BY ' +
+              'is not set: run the Terraform approval stage first'
+    }
+    if (env.TF_APPROVED_AT == null) {
+        error 'terraformApply: the target requires an approval but TF_APPROVED_AT ' +
+              'is not set: run the Terraform approval stage first'
+    }
+    if (env.TF_APPROVED_PLAN_SHA == null) {
+        error 'terraformApply: the target requires an approval but TF_APPROVED_PLAN_SHA ' +
+              'is not set: run the Terraform approval stage first'
+    }
+    if (env.TF_APPROVED_BUILD == null) {
+        error 'terraformApply: the target requires an approval but TF_APPROVED_BUILD ' +
+              'is not set: run the Terraform approval stage first'
+    }
+
+    // 2) identity of the approver
+    String approvedBy = env.TF_APPROVED_BY
+    if (!approvedBy.trim() || approvedBy == 'null') {
+        error 'terraformApply: the approval carries no valid identity ' +
+              '(TF_APPROVED_BY): refusing to apply'
+    }
+
+    // 3) approval date: valid and not in the future
+    java.time.Instant approvedAt
+    try {
+        approvedAt = java.time.Instant.parse(env.TF_APPROVED_AT)
+    } catch (Exception e) {
+        error "terraformApply: invalid TF_APPROVED_AT ('${env.TF_APPROVED_AT}'): " +
+              'refusing to apply'
+    }
+    java.time.Instant now = java.time.Instant.now()
+    if (approvedAt.isAfter(now)) {
+        error "terraformApply: the approval is dated in the future " +
+              "(${env.TF_APPROVED_AT}): refusing to apply"
+    }
+
+    // 4) the approval belongs to THIS build and to THIS plan
+    if (env.TF_APPROVED_BUILD != build) {
+        error "terraformApply: the approval belongs to build ${env.TF_APPROVED_BUILD}, " +
+              "this is build ${build}: refusing to apply"
+    }
+    if (!env.TF_PLAN_SHA256) {
+        error 'terraformApply: TF_PLAN_SHA256 is not set: refusing to apply an approval ' +
+              'that cannot be tied to the plan'
+    }
+    if (env.TF_APPROVED_PLAN_SHA != env.TF_PLAN_SHA256) {
+        error "terraformApply: the approval is for sha256 ${env.TF_APPROVED_PLAN_SHA} " +
+              "but the plan stage published ${env.TF_PLAN_SHA256}: refusing to apply"
+    }
+    if (info.sha256 != env.TF_PLAN_SHA256) {
+        error "terraformApply: the sidecar says sha256=${info.sha256} but the plan " +
+              "stage published ${env.TF_PLAN_SHA256}: refusing to apply"
+    }
+    if (planHash != env.TF_PLAN_SHA256) {
+        error "terraformApply: the SHA-256 of the plan file is ${planHash} but the " +
+              "approval is for ${env.TF_PLAN_SHA256}: the plan changed after it was " +
+              'approved'
+    }
+
+    // 5) freshness of the plan
+    java.time.Instant created
+    try {
+        created = java.time.Instant.parse(info.createdAt)
+    } catch (Exception e) {
+        error "terraformApply: invalid createdAt ('${info.createdAt}'): refusing to apply"
+    }
+    if (created.isAfter(now)) {
+        error "terraformApply: the plan is dated in the future (${info.createdAt}): " +
+              'refusing to apply'
+    }
+    // The approval cannot predate the plan it approves: createdAt <= approvedAt
+    // (equality is allowed: both timestamps can be the same instant).
+    if (approvedAt.isBefore(created)) {
+        error "terraformApply: the approval (${env.TF_APPROVED_AT}) is older than the " +
+              "plan it approves (${info.createdAt}): the approval does not correspond " +
+              'to this plan in time, refusing to apply'
+    }
+    long planAge = java.time.Duration.between(created, now).toMinutes()
+    if (planAge > maxAgeMinutes) {
+        error "terraformApply: the plan is ${planAge} minutes old, more than the " +
+              "maximum of ${maxAgeMinutes}: it expired, request a new build"
+    }
+
+    // 6) freshness of the approval (same window, see the doc of this method).
+    //    Unreachable while the plan-age check and the createdAt <= approvedAt
+    //    rule above hold (an approval is always produced after the plan): kept
+    //    as defence in depth against a tampered `createdAt`.
+    long approvalAge = java.time.Duration.between(approvedAt, now).toMinutes()
+    if (approvalAge > maxAgeMinutes) {
+        error "terraformApply: the approval is ${approvalAge} minutes old, more than " +
+              "the maximum of ${maxAgeMinutes}: it expired, request a new build"
+    }
+
+    return planAge
 }

@@ -97,6 +97,14 @@ circleguardPipeline(
 | `terraformApplyRoot` | `infra/terraform/envs/dev` | Single root applied. Independent from `terraformPlanRoot`, so enabling another environment is always an explicit decision. |
 | `terraformApplyBranches` | `['dev']` | Branches that apply. **PRs and every other branch are excluded** (the stage requires the flag AND the branch). |
 | `terraformApplyTimeout` | `30` | Apply command timeout; the stage budget is `2 ×` this value (init + apply). |
+| `terraformApproval` | `false` | Master switch of the manual approval that will gate an environment apply. **S1: configuration only — the approval step does not exist yet.** |
+| `terraformApprovalTimeout` | `30` | Minutes the approver has to answer (must be `> 0`, otherwise the configuration is rejected). |
+| `terraformApprovalSubmitter` | `admin` | Users/groups allowed to approve (passed to `submitter` of `input`). Must not be empty, otherwise the configuration is rejected. |
+| `terraformApprovalMaxAgeMinutes` | `60` | A plan older than this is rejected instead of applied (must be `> 0`). |
+| `terraformApplyProdRoot` | `infra/terraform/envs/prod` | PROD root (declared, **inert**: no stage consumes it yet). |
+| `terraformApplyProdBranches` | `['main']` | Branch for the PROD target (declared, **inert**). |
+| `terraformApplyProd` | `false` | PROD apply switch: **off**. Independent from `terraformApprovalProd`. |
+| `terraformApprovalProd` | `false` | PROD approval switch: **off**. Both PROD switches must be enabled explicitly. |
 
 ### Stages
 
@@ -111,6 +119,9 @@ circleguardPipeline(
 | Trivy IaC | `trivy config` of `trivyPaths`; HIGH/CRITICAL findings fail the build and the report is archived (if `trivyScan`) |
 | Terraform plan | `terraform init -backend=true` + `terraform plan -detailed-exitcode -out=<root>/ci-<env>-b<build>.tfplan` against the real S3 backend, with `aws-terraform-credentials` injected **by name** (if `terraformPlan` and branch in `terraformPlanBranches`) |
 | Terraform apply | `terraform init -backend=true` + `terraform apply -lock=true ci-<env>-b<build>.tfplan`, the plan of **this** build only (if `terraformApply` and branch in `terraformApplyBranches`) |
+| Terraform plan PROD | same plan step for the PROD root, resolved from the branch (`main` only, and only when `terraformApplyProd` **and** `terraformPlan` are on) |
+| Terraform approval | manual `input` between the PROD plan and the PROD apply (if `terraformApproval` **and** `terraformApprovalProd`, the plan has changes and the build still has a full approval window) |
+| Terraform apply PROD | `terraform apply -lock=true` for the PROD root, only with a valid approval of **this** build (`requireApproval: true`) |
 | Publish images | `docker build` + `docker push` of every image (if `publish` and branch in `publishBranches`); each image is scanned with Trivy **between the build and the push** when `trivyImageScan` is enabled |
 | Deploy | Copies the compose files to the target host over SSH and runs `docker compose up -d --wait` with the published images (if `deploy` and branch in `deployBranches`) |
 | Verify deployment | HTTP check of every component with retries; the build fails if a service does not answer (if `deploy`) |
@@ -316,7 +327,9 @@ resource involved**: the IAM policies are never widened to make a build pass.
 - Next to it, `<plan>.info` records `build`, `commit`, `root`, `changes`,
   `status`, `sha256` and `createdAt` — the provenance that `terraformApply`
   validates. The `sha256` is computed with `sha256sum`: **without that tool the
-  plan step fails closed** and leaves no sidecar.
+  plan step fails closed** and leaves no sidecar. The step **returns** the same
+  hash and the pipeline publishes it as **`env.TF_PLAN_SHA256`** (S2), so the
+  approval step of E4 can bind an approval to the exact plan.
 - It is **not archived**: it must not be downloadable, only reviewable in the
   workspace of the same build (the `Terraform apply` stage reads it from there).
 - The extension is ignored by `.gitignore` (`*.tfplan`), so it can never be committed.
@@ -427,7 +440,7 @@ circleguardPipeline(
 - The scan adds time to the `publish` stage (40 min for 9 images) and the first
   run downloads the database (~50 MB) into the shared cache.
 
-## Terraform apply (DEV only)
+## Terraform apply
 
 Optional stage (`terraformApply: false` by default) that applies **the plan
 produced by the `Terraform plan` stage of the SAME build**. STAGE and PROD are
@@ -450,7 +463,9 @@ circleguardPipeline(
 The plan is named **`ci-<env>-b<build>.tfplan`** and `terraformPlan` writes a
 sidecar **`<plan>.info`** with `build`, `commit`, `root`, `changes`, `status`
 and `createdAt`. The plan stage also publishes `env.TF_PLAN_BUILD`,
-`env.TF_PLAN_ROOT`, `env.TF_PLAN_FILE`, `env.TF_PLAN_INFO` and
+`env.TF_PLAN_ROOT`, `env.TF_PLAN_FILE`, `env.TF_PLAN_INFO`,
+`env.TF_PLAN_SHA256` (the hash the approval step of E4 binds to; `terraformApply`
+still validates it from the sidecar and by recomputing it) and
 `env.TF_PLAN_CHANGES`. Before running anything, `terraformApply` verifies:
 
 1. `env.TF_PLAN_BUILD` exists and equals `env.BUILD_NUMBER`;
@@ -494,6 +509,41 @@ and `createdAt`. The plan stage also publishes `env.TF_PLAN_BUILD`,
 - Stage budget: `terraformApplyTimeout * 2` minutes (init + apply), while each
   command gets `terraformApplyTimeout`.
 
+### PROD target and approval (S5)
+
+The pipeline resolves a **fixed target per branch** (`terraformTarget()`), so a
+branch and a root can never be combined arbitrarily:
+
+| Branch | Target | Plan root | Apply |
+|--------|--------|-----------|-------|
+| `dev` (in `terraformApplyBranches`) | DEV | `terraformPlanRoot` | `terraformApplyRoot`, **no approval** |
+| `main` (in `terraformApplyProdBranches`) | PROD | `terraformApplyProdRoot` | `terraformApplyProdRoot`, **approval required** |
+| PR / any other branch | none | — | — |
+
+- A branch configured for **both** lists, or a PROD target selected from a branch
+  other than `main`, **fails the build** (`terraformTarget()`).
+- Stages: `Terraform plan PROD` → `Terraform approval` → `Terraform apply PROD`,
+  between the DEV plan and `Publish images`.
+- **Gates (all required):** plan `terraformApplyProd` **and** `terraformPlan` +
+  PROD target · approval `terraformApproval` **and** `terraformApprovalProd` +
+  PROD target + plan with changes · apply `terraformApplyProd` + PROD target +
+  plan with changes **and** `TF_APPROVED_TARGET == 'prod'` (otherwise it refuses
+  explicitly, before any credential). The apply step receives `requireApproval: true` and
+  `maxAgeMinutes: terraformApprovalMaxAgeMinutes` and re-validates build, commit,
+  root, both hashes and both ages (S3/S4).
+- **All PROD switches are OFF by default** (`terraformApplyProd`,
+  `terraformApproval`, `terraformApprovalProd`): nothing runs until they are
+  enabled together, and the `Jenkinsfile` was not changed.
+- **Remaining budget guard:** before showing the `input`, the stage calls
+  **`requireApprovalTimeLeft()`**, which computes the time left of the whole
+  build with a plain `System.currentTimeMillis()` anchored at the start of
+  `call()` and compares it with `terraformApprovalTimeout`; if less than a full
+  window is left it fails **without showing the input and without applying**. The anchor is never later
+  than the start of the global `timeout(time: pipelineTimeoutMinutes)` (120 min,
+  single source of truth), so the value is conservative: it can refuse early,
+  never late. `currentBuild.duration` / `currentBuild.rawBuild` were rejected
+  (liveness and deprecation are not verifiable without a real Jenkins run).
+
 ### Concurrency: builds queue
 
 `circleguardPipeline` uses **`disableConcurrentBuilds()`**; the `abortPrevious`
@@ -521,9 +571,20 @@ Operational implications:
 
 ### Known limitations and follow-ups
 
-- **STAGE/PROD are disabled**: enabling them means new values for
-  `terraformApplyRoot`/`terraformApplyBranches` (PROD will also need the manual
-  `input` approval of E4).
+- **STAGE/PROD are disabled**: STAGE has no parameters at all, and PROD is
+  declared in **S1 but inert**: `terraformApplyProdRoot`,
+  `terraformApplyProdBranches`, `terraformApplyProd` and `terraformApprovalProd`
+  exist with safe defaults (**both switches off**) and **no stage consumes them
+  yet**. Enabling them requires the approval step of E4 (S2+) and an explicit
+  `input` approval.
+- **Approval step exists but is not wired yet (S3)**: `terraformApproval` (off),
+  `terraformApprovalTimeout` (30), `terraformApprovalSubmitter` (`admin`) and
+  `terraformApprovalMaxAgeMinutes` (60) are validated when the pipeline is built
+  — timeout and max age must be `> 0`, the submitter must not be empty — and the
+  standalone step `vars/terraformApproval.groovy` now validates the plan (build,
+  commit, root, both hashes and its age) before asking for the `input` and
+  persisting `TF_APPROVED_*`. It is **not called by any stage yet** (S5), so
+  changing these settings still has no effect on the pipeline.
 - `GIT_COMMIT` is **required**: without it the provenance check fails closed.
 - Plans of previous builds (`ci-<env>-b<*>.tfplan`) remain in the `dev`/`main`
   workspaces; they can never be applied (the name carries another build number)

@@ -8,6 +8,14 @@ import org.circleguard.ci.PipelineConfig
  *   circleguardPipeline(integrationTests: true, sonar: false)
  */
 def call(Map rawConfig = [:]) {
+    // Single source of truth for the whole-build budget: the same value feeds the
+    // global timeout below and the remaining-time guard of the manual approval.
+    // The clock starts HERE, before the pipeline begins, so the remaining time
+    // it computes can only be smaller than the real one: the guard can refuse an
+    // approval early, but can never let it start too late.
+    final int pipelineTimeoutMinutes = 120
+    final long pipelineStartedAtMs = System.currentTimeMillis()
+
     PipelineConfig cfg = new PipelineConfig(rawConfig)
 
     // The deployment runs the images produced by this build, so publishing them
@@ -22,7 +30,7 @@ def call(Map rawConfig = [:]) {
         options {
             skipDefaultCheckout()
             timestamps()
-            timeout(time: 120, unit: 'MINUTES')
+            timeout(time: pipelineTimeoutMinutes, unit: 'MINUTES')
             buildDiscarder(logRotator(numToKeepStr: "${cfg.buildsToKeep}", artifactNumToKeepStr: '10'))
             disableConcurrentBuilds()
         }
@@ -147,11 +155,86 @@ def call(Map rawConfig = [:]) {
                         )
                         // Persisted so the apply stage can prove that the plan it
                         // consumes was produced by THIS build and this revision.
+                        // The SHA-256 is the value a future approval (E4) binds to.
                         env.TF_PLAN_BUILD = env.BUILD_NUMBER
                         env.TF_PLAN_ROOT = plan.root
                         env.TF_PLAN_FILE = plan.planFile
                         env.TF_PLAN_INFO = plan.planInfo
+                        env.TF_PLAN_SHA256 = plan.sha256
                         env.TF_PLAN_CHANGES = plan.changes.toString()
+                    }
+                }
+            }
+
+            // PROD plan: the same step as DEV, but for the PROD root. The root
+            // is never chosen freely: terraformTarget() maps 'main' to
+            // terraformApplyProdRoot and refuses any other branch/root pairing.
+            stage('Terraform plan PROD') {
+                when {
+                    expression {
+                        cfg.terraformApplyProd && cfg.terraformPlan &&
+                        terraformTarget(cfg, env.BRANCH_NAME)?.name == 'prod'
+                    }
+                }
+                options {
+                    timeout(time: cfg.terraformPlanTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        Map target = terraformTarget(cfg, env.BRANCH_NAME)
+                        Map plan = terraformPlan(
+                            image: cfg.terraformImage,
+                            root: target.root,
+                            credentialsId: cfg.terraformAwsCredentialsId,
+                            region: cfg.terraformAwsRegion,
+                            minFreeSpaceMB: cfg.terraformMinFreeSpaceMB,
+                            timeout: cfg.terraformPlanTimeout
+                        )
+                        // Same contract as the DEV plan stage above: the apply
+                        // stage validates every one of these before touching AWS.
+                        env.TF_PLAN_BUILD = env.BUILD_NUMBER
+                        env.TF_PLAN_ROOT = plan.root
+                        env.TF_PLAN_FILE = plan.planFile
+                        env.TF_PLAN_INFO = plan.planInfo
+                        env.TF_PLAN_SHA256 = plan.sha256
+                        env.TF_PLAN_CHANGES = plan.changes.toString()
+                    }
+                }
+            }
+
+            // Manual approval of the PROD infrastructure, between the plan and
+            // the apply. It runs only when BOTH approval switches are on, only
+            // for the PROD target, and only when the plan has changes; and only
+            // while the build still has a full approval window left.
+            // A failed or interrupted approval stops the pipeline here: the
+            // stages below never run (nothing is swallowed in this stage).
+            stage('Terraform approval') {
+                when {
+                    expression {
+                        cfg.terraformApplyProd && cfg.terraformApproval && cfg.terraformApprovalProd &&
+                        terraformTarget(cfg, env.BRANCH_NAME)?.name == 'prod' &&
+                        env.TF_PLAN_CHANGES == 'true'
+                    }
+                }
+                options {
+                    timeout(time: cfg.terraformApprovalTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        // Fail BEFORE showing the input when the build budget is
+                        // too short for a full approval window.
+                        requireApprovalTimeLeft(pipelineStartedAtMs, pipelineTimeoutMinutes,
+                                                cfg.terraformApprovalTimeout)
+                        Map target = terraformTarget(cfg, env.BRANCH_NAME)
+                        terraformApproval(
+                            root: target.root,
+                            submitter: cfg.terraformApprovalSubmitter,
+                            timeout: cfg.terraformApprovalTimeout,
+                            maxAgeMinutes: cfg.terraformApprovalMaxAgeMinutes
+                        )
+                        // Binds this approval to the PROD target of this build:
+                        // the apply stage below refuses to run without it.
+                        env.TF_APPROVED_TARGET = target.name
                     }
                 }
             }
@@ -174,7 +257,46 @@ def call(Map rawConfig = [:]) {
                             credentialsId: cfg.terraformAwsCredentialsId,
                             region: cfg.terraformAwsRegion,
                             minFreeSpaceMB: cfg.terraformMinFreeSpaceMB,
-                            timeout: cfg.terraformApplyTimeout
+                            timeout: cfg.terraformApplyTimeout,
+                            // DEV never requires an approval (the PROD stage below does)
+                            requireApproval: false
+                        )
+                    }
+                }
+            }
+
+            // PROD apply: only after a valid approval of THIS build. The step
+            // re-validates build, commit, root, both hashes and both ages before
+            // it binds the credential, so an approval of another plan or another
+            // build can never be reused here.
+            stage('Terraform apply PROD') {
+                when {
+                    expression {
+                        cfg.terraformApplyProd && env.TF_PLAN_CHANGES == 'true' &&
+                        terraformTarget(cfg, env.BRANCH_NAME)?.name == 'prod'
+                    }
+                }
+                options {
+                    timeout(time: cfg.terraformApplyTimeout * 2, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        if (env.TF_APPROVED_TARGET != 'prod') {
+                            error 'Terraform apply PROD: no approval was recorded for this build ' +
+                                  "(TF_APPROVED_TARGET='${env.TF_APPROVED_TARGET}'): enable " +
+                                  'terraformApproval AND terraformApprovalProd and start a new ' +
+                                  'build. Nothing will be applied.'
+                        }
+                        Map target = terraformTarget(cfg, env.BRANCH_NAME)
+                        terraformApply(
+                            image: cfg.terraformImage,
+                            root: target.root,
+                            credentialsId: cfg.terraformAwsCredentialsId,
+                            region: cfg.terraformAwsRegion,
+                            minFreeSpaceMB: cfg.terraformMinFreeSpaceMB,
+                            timeout: cfg.terraformApplyTimeout,
+                            requireApproval: true,
+                            maxAgeMinutes: cfg.terraformApprovalMaxAgeMinutes
                         )
                     }
                 }
@@ -386,4 +508,84 @@ def call(Map rawConfig = [:]) {
             }
         }
     }
+}
+
+/**
+ * Terraform target of a branch, resolved ONLY from the configuration, so a
+ * branch and a root can never be combined arbitrarily:
+ *
+ *   - a branch in terraformApplyProdBranches drives the PROD target (root
+ *     terraformApplyProdRoot) and is only accepted when it is 'main';
+ *   - a branch in terraformApplyBranches drives the DEV target (root
+ *     terraformApplyRoot);
+ *   - anything else (PRs, feature branches) drives no target and returns null.
+ *
+ * Fails when one branch is configured for both targets or when PROD would be
+ * selected from a branch other than 'main'.
+ */
+Map terraformTarget(PipelineConfig cfg, String branch) {
+    if (!branch) {
+        return null
+    }
+    boolean prodBranch = cfg.terraformApplyProdBranches.contains(branch)
+    boolean devBranch = cfg.terraformApplyBranches.contains(branch)
+    if (prodBranch && devBranch) {
+        error "circleguardPipeline: branch '${branch}' belongs to BOTH terraformApplyBranches " +
+              'and terraformApplyProdBranches: refusing to pick a root arbitrarily'
+    }
+    if (prodBranch && branch != 'main') {
+        error "circleguardPipeline: the PROD Terraform target is only allowed from 'main' " +
+              "(not from '${branch}'): refusing to select ${cfg.terraformApplyProdRoot}"
+    }
+    if (prodBranch) {
+        return [name: 'prod', root: cfg.terraformApplyProdRoot]
+    }
+    if (devBranch) {
+        return [name: 'dev', root: cfg.terraformApplyRoot]
+    }
+    return null
+}
+
+/**
+ * Fails when the build does not have a full approval window left, so the input
+ * is never shown (and no apply can follow) when the global timeout would abort
+ * the build in the middle of the approval.
+ *
+ * The DECISION is taken with exact milliseconds (budget vs elapsed vs approval
+ * window): minutes are only used to word the message, so a partial minute can
+ * never be mistaken for a full one. The clock is a plain
+ * System.currentTimeMillis() anchored at the very start of call(): no Jenkins
+ * API is involved, and because that anchor is never later than the start of the
+ * global `timeout`, the remaining time computed here is always <= the real one —
+ * conservative: it can refuse early, never late.
+ *
+ * `nowMs` exists only so the boundary cases can be tested deterministically;
+ * production omits it and uses the real clock.
+ */
+void requireApprovalTimeLeft(long startedAtMs, int budgetMinutes, int approvalMinutes, Long nowMs = null) {
+    if (budgetMinutes <= 0) {
+        error "Terraform approval: the build budget must be > 0 minutes, got ${budgetMinutes}"
+    }
+    if (approvalMinutes <= 0) {
+        error "Terraform approval: the approval window must be > 0 minutes, got ${approvalMinutes}"
+    }
+    long now = (nowMs != null) ? nowMs : System.currentTimeMillis()
+    long elapsedMs = now - startedAtMs
+    if (elapsedMs < 0) {
+        error "Terraform approval: the elapsed time is negative (${elapsedMs} ms): " +
+              'refusing to estimate the remaining build budget'
+    }
+    long budgetMs = ((long) budgetMinutes) * 60_000L
+    long approvalMs = ((long) approvalMinutes) * 60_000L
+    long remainingMs = budgetMs - elapsedMs
+    if (remainingMs < approvalMs) {
+        error "Terraform approval: " +
+              "${java.util.concurrent.TimeUnit.MILLISECONDS.toMinutes(remainingMs)} minute(s) left " +
+              "of the ${budgetMinutes}-minute build budget, less than the ${approvalMinutes} " +
+              'required for a full approval: NOT requesting the approval and NOT applying ' +
+              'anything (start a new build)'
+    }
+    echo "terraformApproval: " +
+         "${java.util.concurrent.TimeUnit.MILLISECONDS.toMinutes(remainingMs)} minute(s) left " +
+         "of the ${budgetMinutes}-minute build budget"
 }

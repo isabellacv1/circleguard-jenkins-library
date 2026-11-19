@@ -118,6 +118,22 @@ class PipelineConfig implements Serializable {
     List<String> terraformApplyBranches = ['dev']
     int terraformApplyTimeout = 30
 
+    // Terraform approval (E4, S1: configuration only, no step yet): the manual
+    // gate that will sit between the plan and the apply of an environment that
+    // requires it (PROD). Every switch is OFF by default, so nothing runs and
+    // nothing can be approved by accident until the approval step exists.
+    boolean terraformApproval = false
+    int terraformApprovalTimeout = 30           // minutes the approver has to answer
+    String terraformApprovalSubmitter = 'admin' // users/groups allowed to approve
+    int terraformApprovalMaxAgeMinutes = 60     // a plan older than this is rejected
+
+    // PROD target (E4): declared so the configuration is complete, but INERT:
+    // applying PROD and approving PROD are two independent switches, both off.
+    String terraformApplyProdRoot = 'infra/terraform/envs/prod'
+    List<String> terraformApplyProdBranches = ['main']
+    boolean terraformApplyProd = false
+    boolean terraformApprovalProd = false
+
     int buildTimeout = 30
     int testTimeout = 45
     int integrationTimeout = 30
@@ -185,11 +201,42 @@ class PipelineConfig implements Serializable {
         this.terraformApplyRoot = c.terraformApplyRoot ?: this.terraformApplyRoot
         this.terraformApplyBranches = c.terraformApplyBranches ?: this.terraformApplyBranches
         this.terraformApplyTimeout = c.terraformApplyTimeout ? c.terraformApplyTimeout as int : this.terraformApplyTimeout
+        this.terraformApproval = c.terraformApproval != null ? c.terraformApproval as boolean : this.terraformApproval
+        // containsKey + null check ONLY for the validated values: `0` and '' are
+        // falsy in Groovy, so the `?:` pattern would silently replace them with
+        // the defaults and the validation at the end would never see them.
+        this.terraformApprovalTimeout = (c.containsKey('terraformApprovalTimeout') && c.terraformApprovalTimeout != null) ? c.terraformApprovalTimeout as int : this.terraformApprovalTimeout
+        this.terraformApprovalSubmitter = (c.containsKey('terraformApprovalSubmitter') && c.terraformApprovalSubmitter != null) ? c.terraformApprovalSubmitter as String : this.terraformApprovalSubmitter
+        this.terraformApprovalMaxAgeMinutes = (c.containsKey('terraformApprovalMaxAgeMinutes') && c.terraformApprovalMaxAgeMinutes != null) ? c.terraformApprovalMaxAgeMinutes as int : this.terraformApprovalMaxAgeMinutes
+        this.terraformApplyProdRoot = c.terraformApplyProdRoot ?: this.terraformApplyProdRoot
+        this.terraformApplyProdBranches = c.terraformApplyProdBranches ?: this.terraformApplyProdBranches
+        this.terraformApplyProd = c.terraformApplyProd != null ? c.terraformApplyProd as boolean : this.terraformApplyProd
+        this.terraformApprovalProd = c.terraformApprovalProd != null ? c.terraformApprovalProd as boolean : this.terraformApprovalProd
         this.buildTimeout = c.buildTimeout ? c.buildTimeout as int : this.buildTimeout
         this.testTimeout = c.testTimeout ? c.testTimeout as int : this.testTimeout
         this.integrationTimeout = c.integrationTimeout ? c.integrationTimeout as int : this.integrationTimeout
         this.publishTimeout = c.publishTimeout ? c.publishTimeout as int : this.publishTimeout
         this.buildsToKeep = c.buildsToKeep ? c.buildsToKeep as int : this.buildsToKeep
         this.discordCredentialsId = c.discordCredentialsId != null ? c.discordCredentialsId : this.discordCredentialsId
+
+        // Fail fast on an invalid approval configuration: a timeout or an age of
+        // 0 minutes, or an empty submitter, would make the approval impossible to
+        // grant (or meaningless). Better to refuse the configuration than to run
+        // a stage that can never be approved. These checks run for every build,
+        // even with the approval disabled, so a typo is caught early.
+        if (this.terraformApprovalTimeout <= 0) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: terraformApprovalTimeout must be > 0 minutes, got ' +
+                    this.terraformApprovalTimeout)
+        }
+        if (this.terraformApprovalMaxAgeMinutes <= 0) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: terraformApprovalMaxAgeMinutes must be > 0 minutes, got ' +
+                    this.terraformApprovalMaxAgeMinutes)
+        }
+        if (this.terraformApprovalSubmitter == null || !this.terraformApprovalSubmitter.trim()) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: terraformApprovalSubmitter must not be empty')
+        }
     }
 }

@@ -97,9 +97,10 @@ def tokenizeShell = { String s ->
  * Returns a map with: script, sh (recorded commands), logs, archived, written
  * (file -> content written by the stubbed writeFile), withEnv,
  * withCredentials (the bindings recorded by the stubbed withCredentials),
- * junit (the testResults published by the stubbed junit) and trace (the ordered
- * record of sh commands plus the stubbed sibling steps: ensureBuildx,
- * dockerCleanup, trivyImageScan).
+ * junit (the testResults published by the stubbed junit), inputs (the maps
+ * received by the stubbed input step) and trace (the ordered record of sh
+ * commands plus the stubbed sibling steps: ensureBuildx, dockerCleanup,
+ * trivyImageScan).
  * opts.status               exit code returned by sh(..., returnStatus: true)
  * opts.missing              paths for which fileExists() answers false
  * opts.files                contents returned by readFile()
@@ -110,6 +111,8 @@ def tokenizeShell = { String s ->
  * opts.failArchiveContains  archiveArtifacts throws for the files containing this value
  * opts.failWriteFileContains writeFile throws for the files whose name contains this value
  * opts.failScan             when true, the trivyImageScan stub throws (checks the push gate)
+ * opts.inputResult          value returned by the stubbed input step ('admin' default)
+ * opts.failInput            Throwable thrown by the stubbed input step (expired/cancelled)
  */
 def newStep = { String name, Map opts = [:] ->
     def script = loader.parseClass(new File(root, "vars/${name}.groovy")).newInstance()
@@ -124,6 +127,7 @@ def newStep = { String name, Map opts = [:] ->
         withEnv : [],
         withCredentials: [],
         junit   : [],
+        inputs  : [],        // maps passed to the stubbed input step
         trace   : []     // ordered: sh commands + stubbed sibling steps (order assertions)
     ]
     def binding = new Binding()
@@ -203,6 +207,16 @@ def newStep = { String name, Map opts = [:] ->
     binding.setVariable('junit', { Object a ->
         b.junit << (a instanceof Map ? a.testResults : a.toString())
     })
+    // input: records every call (message, ok, submitter, submitterParameter,
+    // timeout, timeUnit) and returns opts.inputResult ('admin' by default);
+    // opts.failInput throws, simulating an expired or cancelled approval.
+    binding.setVariable('input', { Object a ->
+        b.inputs << (a instanceof Map ? a : [value: a])
+        if (opts.failInput) {
+            throw opts.failInput
+        }
+        return opts.containsKey('inputResult') ? opts.inputResult : 'admin'
+    })
     binding.setVariable('timeout', { Object o, Closure c -> c.call() })
     script.binding = binding
 
@@ -225,8 +239,8 @@ def newStep = { String name, Map opts = [:] ->
     })
 
     [script: script, sh: b.sh, logs: b.logs, archived: b.archived, written: b.written,
-     withEnv: b.withEnv, withCredentials: b.withCredentials, junit: b.junit,
-     trace: b.trace]
+     env: b.env, withEnv: b.withEnv, withCredentials: b.withCredentials, junit: b.junit,
+     inputs: b.inputs, trace: b.trace]
 }
 
 println 'runInContainer'
@@ -616,6 +630,11 @@ test('plans DEV against the real S3 backend with the credential bound by name') 
     assert result.planInfo == 'infra/terraform/envs/dev/ci-dev-b42.tfplan.info'
     assert result.status == 0
     assert result.changes == false
+    // the hash is part of the return value (S2) and matches the sidecar
+    assert result.sha256 == PLAN_SHA: result
+    assert result.containsKey('sha256'): 'the hash must be returned'
+    assert result.keySet().containsAll(['root', 'planFile', 'planInfo', 'changes', 'status']):
+        "the previous fields must be kept: ${result.keySet()}"
     assert h.logs.any { it.contains('NO changes') }: h.logs
 
     // sidecar with the provenance of THIS plan: the build number is part of the
@@ -1363,6 +1382,705 @@ test('shows the AccessDenied guidance only for an AccessDenied failure') {
     assert !h.written.containsKey(APPLY_MARKER): 'a failed apply is never marked'
 }
 
+println 'terraformApproval'
+// Local stand-ins for the Jenkins exception and its timeout cause: the real
+// classes are not on the classpath of the tests and the step detects them BY
+// NAME (importing them would make these tests impossible to run locally).
+class FlowInterruptedException extends RuntimeException {
+    List causes = []
+    FlowInterruptedException(String message) { super(message) }
+    FlowInterruptedException(String message, List causes) { super(message); this.causes = causes }
+}
+class ExceededTimeout { }
+
+String APPR_ROOT = 'infra/terraform/envs/dev'
+String APPR_PLAN_PATH = "${APPR_ROOT}/ci-dev-b42.tfplan"
+String APPR_INFO_PATH = "${APPR_PLAN_PATH}.info"
+String APPR_SHA = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+
+// sidecar of a plan produced 5 minutes ago (inside the 60 minute limit)
+def approvalSidecar = { String createdAt = java.time.Instant.now().minusSeconds(300).toString() ->
+    "build=42\ncommit=abc1234\nroot=${APPR_ROOT}\nchanges=true\nstatus=2\n" +
+    "sha256=${APPR_SHA}\ncreatedAt=${createdAt}\n"
+}
+
+def approvalEnv = { Map extra = [:] ->
+    Map e = [WORKSPACE: '/var/jenkins_home/workspace/circleguard_dev',
+             BUILD_NUMBER: '42', GIT_COMMIT: 'abc1234', BRANCH_NAME: 'dev',
+             TF_PLAN_BUILD: '42', TF_PLAN_ROOT: APPR_ROOT,
+             TF_PLAN_FILE: APPR_PLAN_PATH, TF_PLAN_INFO: APPR_INFO_PATH,
+             TF_PLAN_SHA256: APPR_SHA, TF_PLAN_CHANGES: 'true']
+    e.putAll(extra)
+    e
+}
+
+test('asks for the approval and persists the four values') {
+    def h = newStep('terraformApproval', [env: approvalEnv(),
+                                          files: [(APPR_INFO_PATH): approvalSidecar()],
+                                          stdout: APPR_SHA,
+                                          inputResult: 'alice'])
+    def result = h.script.call(root: APPR_ROOT, submitter: 'admin',
+                               timeout: 30, maxAgeMinutes: 60)
+
+    // the only command is the local hash: no docker, no terraform, no AWS
+    assert h.sh.size() == 1: "expected only sha256sum, got ${h.sh}"
+    assert h.sh[0] == "sha256sum \"${APPR_PLAN_PATH}\"": h.sh[0]
+    assert !h.sh.any { it.contains('docker run') }: 'no container may be started'
+
+    // the input carries the required identity and limits
+    assert h.inputs.size() == 1: 'input must be called exactly once'
+    Map inp = h.inputs[0]
+    assert inp.submitter == 'admin': inp
+    assert inp.submitterParameter == 'approvedBy': inp
+    assert inp.timeout == 30: inp
+    assert inp.timeUnit == 'MINUTES': inp
+    assert inp.ok == 'Approve terraform apply': inp
+    // and the message identifies the plan being approved
+    assert inp.message.contains('Build     : 42'): inp.message
+    assert inp.message.contains('Commit    : abc1234'): inp.message
+    assert inp.message.contains("Root      : ${APPR_ROOT}"): inp.message
+    assert inp.message.contains("SHA-256   : ${APPR_SHA}"): inp.message
+    assert inp.message.contains('Changes   : yes'): inp.message
+    assert inp.message.contains('Plan age  :'): inp.message
+
+    // the four values are persisted
+    assert h.env.TF_APPROVED_BY == 'alice': h.env
+    assert h.env.TF_APPROVED_AT && h.env.TF_APPROVED_AT.length() > 10: h.env
+    assert h.env.TF_APPROVED_PLAN_SHA == APPR_SHA: h.env
+    assert h.env.TF_APPROVED_BUILD == '42': h.env
+
+    assert result.approvedBy == 'alice'
+    assert result.approvedAt == h.env.TF_APPROVED_AT
+    assert result.sha256 == APPR_SHA
+    assert result.build == '42'
+}
+
+test('rejects a plan of another build, commit, root or hash before asking') {
+    // build of another build (env)
+    def a = newStep('terraformApproval', [env: approvalEnv([TF_PLAN_BUILD: '41']),
+                                          files: [(APPR_INFO_PATH): approvalSidecar()],
+                                          stdout: APPR_SHA])
+    try {
+        a.script.call(root: APPR_ROOT)
+        assert false: 'a plan of another build must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('belongs to build 41'): e.message
+    }
+
+    // commit of another revision (sidecar)
+    String otherCommit = approvalSidecar().replace('commit=abc1234', 'commit=deadbee')
+    def b = newStep('terraformApproval', [env: approvalEnv(),
+                                          files: [(APPR_INFO_PATH): otherCommit],
+                                          stdout: APPR_SHA])
+    try {
+        b.script.call(root: APPR_ROOT)
+        assert false: 'a plan of another commit must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('another revision'): e.message
+    }
+
+    // root of another environment (env)
+    def c = newStep('terraformApproval', [env: approvalEnv([TF_PLAN_ROOT: 'infra/terraform/envs/stage']),
+                                          files: [(APPR_INFO_PATH): approvalSidecar()],
+                                          stdout: APPR_SHA])
+    try {
+        c.script.call(root: APPR_ROOT)
+        assert false: 'a plan of another root must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('refusing to approve the wrong plan'): e.message
+    }
+
+    // root of another environment (sidecar)
+    String otherRoot = approvalSidecar().replace("root=${APPR_ROOT}", 'root=infra/terraform/envs/stage')
+    def d = newStep('terraformApproval', [env: approvalEnv(),
+                                          files: [(APPR_INFO_PATH): otherRoot],
+                                          stdout: APPR_SHA])
+    try {
+        d.script.call(root: APPR_ROOT)
+        assert false: 'a sidecar of another root must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('the sidecar says root=infra/terraform/envs/stage'): e.message
+    }
+
+    // hash published by the plan stage differs from the sidecar
+    def e1 = newStep('terraformApproval', [env: approvalEnv([TF_PLAN_SHA256: PLAN_SHA]),
+                                           files: [(APPR_INFO_PATH): approvalSidecar()],
+                                           stdout: APPR_SHA])
+    try {
+        e1.script.call(root: APPR_ROOT)
+        assert false: 'an inconsistent hash must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('inconsistent plan state'): e.message
+    }
+
+    // every one of them fails before the hash command and before the input
+    [a, b, c, d, e1].eachWithIndex { def h, int i ->
+        assert h.sh.isEmpty(): "case ${i}: nothing must run (${h.sh})"
+        assert h.inputs.isEmpty(): "case ${i}: input must not be called"
+        assert !h.env.containsKey('TF_APPROVED_BY'): "case ${i}: no approval may be persisted"
+    }
+}
+
+test('refuses a plan whose recomputed sha256 differs from the sidecar') {
+    def h = newStep('terraformApproval', [env: approvalEnv(),
+                                          files: [(APPR_INFO_PATH): approvalSidecar()],
+                                          stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'])
+    try {
+        h.script.call(root: APPR_ROOT)
+        assert false: 'a modified plan must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('the plan changed after it was produced'): e.message
+        assert e.message.contains(APPR_SHA): e.message
+    }
+    assert h.sh.size() == 1: 'the hash was computed'
+    assert h.sh[0].startsWith('sha256sum')
+    assert h.inputs.isEmpty(): 'input must not be called'
+    assert !h.env.containsKey('TF_APPROVED_BY')
+}
+
+test('rejects a missing or malformed sidecar') {
+    def missing = newStep('terraformApproval', [env: approvalEnv(),
+                                                missing: [APPR_INFO_PATH]])
+    try {
+        missing.script.call(root: APPR_ROOT)
+        assert false: 'a missing sidecar must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('sidecar'): e.message
+    }
+
+    def malformed = newStep('terraformApproval', [env: approvalEnv(),
+                                                  files: [(APPR_INFO_PATH): 'garbage\nwithout keys\n']])
+    try {
+        malformed.script.call(root: APPR_ROOT)
+        assert false: 'a malformed sidecar must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('the sidecar says build=null'): e.message
+    }
+
+    [missing, malformed].each { def h ->
+        assert h.sh.isEmpty(): "nothing must run (${h.sh})"
+        assert h.inputs.isEmpty(): 'input must not be called'
+        assert !h.env.containsKey('TF_APPROVED_BY')
+    }
+}
+
+test('refuses a plan without changes') {
+    def noChanges = newStep('terraformApproval', [env: approvalEnv([TF_PLAN_CHANGES: 'false']),
+                                                  files: [(APPR_INFO_PATH): approvalSidecar()],
+                                                  stdout: APPR_SHA])
+    try {
+        noChanges.script.call(root: APPR_ROOT)
+        assert false: 'a plan without changes must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('nothing to approve'): e.message
+    }
+
+    String sidecarNoChanges = approvalSidecar().replace('changes=true', 'changes=false')
+    def sidecarSays = newStep('terraformApproval', [env: approvalEnv(),
+                                                    files: [(APPR_INFO_PATH): sidecarNoChanges],
+                                                    stdout: APPR_SHA])
+    try {
+        sidecarSays.script.call(root: APPR_ROOT)
+        assert false: 'a sidecar without changes must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('the sidecar says changes=false'): e.message
+    }
+
+    [noChanges, sidecarSays].each { def h ->
+        assert h.sh.isEmpty(): "nothing must run (${h.sh})"
+        assert h.inputs.isEmpty(): 'input must not be called'
+        assert !h.env.containsKey('TF_APPROVED_BY')
+    }
+}
+
+test('refuses a plan older than the maximum age') {
+    String old = java.time.Instant.now().minusSeconds(120 * 60).toString()
+    def h = newStep('terraformApproval', [env: approvalEnv(),
+                                          files: [(APPR_INFO_PATH): approvalSidecar(old)],
+                                          stdout: APPR_SHA])
+    try {
+        h.script.call(root: APPR_ROOT, maxAgeMinutes: 60)
+        assert false: 'an expired plan must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('more than the maximum of 60'): e.message
+        assert e.message.contains('request a new build'): e.message
+    }
+    assert h.sh.size() == 1: 'the hash was computed before the age check'
+    assert h.inputs.isEmpty(): 'input must not be called'
+    assert !h.env.containsKey('TF_APPROVED_BY')
+}
+
+test('refuses an invalid or future createdAt') {
+    def invalid = newStep('terraformApproval', [env: approvalEnv(),
+                                                files: [(APPR_INFO_PATH): approvalSidecar('not-a-date')],
+                                                stdout: APPR_SHA])
+    try {
+        invalid.script.call(root: APPR_ROOT)
+        assert false: 'an invalid timestamp must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('invalid createdAt'): e.message
+    }
+
+    String future = java.time.Instant.now().plusSeconds(5 * 60).toString()
+    def futurePlan = newStep('terraformApproval', [env: approvalEnv(),
+                                                   files: [(APPR_INFO_PATH): approvalSidecar(future)],
+                                                   stdout: APPR_SHA])
+    try {
+        futurePlan.script.call(root: APPR_ROOT)
+        assert false: 'a future timestamp must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('dated in the future'): e.message
+    }
+
+    [invalid, futurePlan].each { def h ->
+        assert h.sh.size() == 1: 'the hash was computed'
+        assert h.inputs.isEmpty(): 'input must not be called'
+        assert !h.env.containsKey('TF_APPROVED_BY')
+    }
+}
+
+test('rethrows the original interruption without persisting any approval') {
+    // expired (timeout)
+    def expired = new FlowInterruptedException('Timeout has been exceeded')
+    def h1 = newStep('terraformApproval', [env: approvalEnv(),
+                                           files: [(APPR_INFO_PATH): approvalSidecar()],
+                                           stdout: APPR_SHA,
+                                           failInput: expired])
+    try {
+        h1.script.call(root: APPR_ROOT)
+        assert false: 'an expired approval must fail the step'
+    } catch (RuntimeException e) {
+        assert e.is(expired): 'the ORIGINAL exception must be rethrown'
+        assert e.message.contains('Timeout has been exceeded'): e.message
+    }
+    assert h1.inputs.size() == 1: 'input was attempted'
+    assert h1.logs.any { it.contains('NO infrastructure was changed') }: h1.logs
+    assert h1.logs.any { it.contains('expired or cancelled') }: h1.logs
+    assert !h1.env.containsKey('TF_APPROVED_BY'): 'no approval may be persisted'
+    assert !h1.env.containsKey('TF_APPROVED_PLAN_SHA')
+
+    // cancelled by the user (cause reported by Jenkins)
+    def cancelled = new FlowInterruptedException('Aborted by user', [new Object()])
+    def h2 = newStep('terraformApproval', [env: approvalEnv(),
+                                           files: [(APPR_INFO_PATH): approvalSidecar()],
+                                           stdout: APPR_SHA,
+                                           failInput: cancelled])
+    try {
+        h2.script.call(root: APPR_ROOT)
+        assert false: 'a cancelled approval must fail the step'
+    } catch (RuntimeException e) {
+        assert e.is(cancelled): 'the ORIGINAL exception must be rethrown'
+    }
+    assert h2.logs.any { it.contains('was cancelled') }: h2.logs
+    assert !h2.env.containsKey('TF_APPROVED_BY')
+
+    // timeout cause reported by Jenkins
+    def timedOut = new FlowInterruptedException('Timeout', [new ExceededTimeout()])
+    def h3 = newStep('terraformApproval', [env: approvalEnv(),
+                                           files: [(APPR_INFO_PATH): approvalSidecar()],
+                                           stdout: APPR_SHA,
+                                           failInput: timedOut])
+    try {
+        h3.script.call(root: APPR_ROOT)
+        assert false: 'a timed out approval must fail the step'
+    } catch (RuntimeException e) {
+        assert e.is(timedOut): 'the ORIGINAL exception must be rethrown'
+    }
+    assert h3.logs.any { it.contains('expired (timeout)') }: h3.logs
+    assert !h3.env.containsKey('TF_APPROVED_BY')
+}
+
+test('refuses an approval without a valid identity') {
+    def empty = newStep('terraformApproval', [env: approvalEnv(),
+                                              files: [(APPR_INFO_PATH): approvalSidecar()],
+                                              stdout: APPR_SHA,
+                                              inputResult: ''])
+    try {
+        empty.script.call(root: APPR_ROOT)
+        assert false: 'an empty identity must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('no valid identity'): e.message
+    }
+    assert empty.inputs.size() == 1: 'input was attempted'
+    assert !empty.env.containsKey('TF_APPROVED_BY'): 'no approval may be persisted'
+    assert !empty.env.containsKey('TF_APPROVED_AT')
+    assert !empty.env.containsKey('TF_APPROVED_PLAN_SHA')
+    assert !empty.env.containsKey('TF_APPROVED_BUILD')
+
+    def nullIdentity = newStep('terraformApproval', [env: approvalEnv(),
+                                                     files: [(APPR_INFO_PATH): approvalSidecar()],
+                                                     stdout: APPR_SHA,
+                                                     inputResult: null])
+    try {
+        nullIdentity.script.call(root: APPR_ROOT)
+        assert false: 'a missing identity must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('no valid identity'): e.message
+    }
+    assert nullIdentity.inputs.size() == 1
+    assert !nullIdentity.env.containsKey('TF_APPROVED_BY')
+}
+
+test('never runs Docker, Terraform or AWS commands (source level)') {
+    String step = new File(root, 'vars/terraformApproval.groovy').text
+    assert !step.contains('docker run'): 'no container'
+    assert !step.contains('runInContainer'): 'this step never starts a container'
+    assert !step.contains('withCredentials'): 'no AWS credential in this step'
+    assert !step.contains('AWS_ACCESS_KEY_ID'): 'no AWS variable'
+    assert !step.contains('sh "terraform'): 'no terraform command'
+    assert step.contains('sha256sum'): 'the local hash is required'
+    assert step.contains('submitterParameter'): 'the approver must be recorded'
+    assert step.contains('throw e'): 'the original interruption must be rethrown'
+    assert step.contains('TF_APPROVED_PLAN_SHA')
+    // S5: the pipeline invokes it from its own stage, between plan and apply
+    String pipeline = new File(root, 'vars/circleguardPipeline.groovy').text
+    assert pipeline.contains("stage('Terraform approval')"): 'the approval stage must exist'
+    assert pipeline.contains('terraformApproval('): 'the pipeline must invoke the step'
+}
+
+// --- approval gate (S4): only a target with requireApproval goes through this ---
+// sidecar with a createdAt inside the validity window (5 minutes old)
+def freshSidecar = { String createdAt = java.time.Instant.now().minusSeconds(300).toString() ->
+    APPLY_SIDECAR.replaceFirst('createdAt=[^\n]*', "createdAt=${createdAt}")
+}
+
+// env of a build whose plan was approved for THIS build and THIS hash
+def approvedEnv = { Map extra = [:] ->
+    Map e = applyEnv('true', [TF_PLAN_SHA256: APPLY_SHA,
+                              TF_APPROVED_BY: 'alice',
+                              TF_APPROVED_AT: java.time.Instant.now().minusSeconds(120).toString(),
+                              TF_APPROVED_PLAN_SHA: APPLY_SHA,
+                              TF_APPROVED_BUILD: '42'])
+    e.putAll(extra)
+    e
+}
+
+test('applies DEV without any approval when the target does not require one') {
+    def h = newStep('terraformApply', [env: applyEnv('true'),   // no TF_APPROVED_* at all
+                                       files: [(APPLY_INFO_PATH): APPLY_SIDECAR],
+                                       missing: [APPLY_MARKER],
+                                       stdout: APPLY_SHA])
+    def result = h.script.call(root: APPLY_ROOT) // requireApproval defaults to false
+
+    assert result.status == 'APPLIED': result
+    // the exact command sequence of the approved DEV behaviour
+    assert h.sh.size() == 6: "expected 6 commands, got ${h.sh.size()}"
+    assert h.sh[0].startsWith('df -Pk')
+    assert h.sh[1].startsWith('sha256sum')
+    assert h.sh[4].contains(' apply ')
+    assert h.sh[5].startsWith('rm -f')
+    assert h.withCredentials.size() == 1
+    assert !h.env.containsKey('TF_APPROVED_BY'): 'DEV must not demand an approval'
+    assert h.archived == [APPLY_EVIDENCE]
+    assert !h.written[APPLY_EVIDENCE].contains('Approved by'):
+        'DEV evidence must not carry approval fields'
+}
+
+test('refuses an approval-gated apply when any approval value is missing') {
+    ['TF_APPROVED_BY', 'TF_APPROVED_AT', 'TF_APPROVED_PLAN_SHA', 'TF_APPROVED_BUILD'].each { String key ->
+        Map env = approvedEnv()
+        env.remove(key)
+        def h = newStep('terraformApply', [env: env,
+                                           files: [(APPLY_INFO_PATH): freshSidecar()],
+                                           missing: [APPLY_MARKER],
+                                           stdout: APPLY_SHA])
+        try {
+            h.script.call(root: APPLY_ROOT, requireApproval: true)
+            assert false: "a missing ${key} must be rejected"
+        } catch (RuntimeException e) {
+            assert e.message.contains(key): e.message
+        }
+        assert h.withCredentials.isEmpty(): "${key}: must fail before the credentials"
+        assert !h.sh.any { it.contains('docker run') }: "${key}: must fail before Terraform"
+    }
+}
+
+test('refuses an approval issued for another build or with an empty approver') {
+    def otherBuild = newStep('terraformApply', [env: approvedEnv([TF_APPROVED_BUILD: '41']),
+                                                files: [(APPLY_INFO_PATH): freshSidecar()],
+                                                missing: [APPLY_MARKER],
+                                                stdout: APPLY_SHA])
+    try {
+        otherBuild.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'an approval of another build must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('the approval belongs to build 41'): e.message
+    }
+
+    def emptyApprover = newStep('terraformApply', [env: approvedEnv([TF_APPROVED_BY: '']),
+                                                   files: [(APPLY_INFO_PATH): freshSidecar()],
+                                                   missing: [APPLY_MARKER],
+                                                   stdout: APPLY_SHA])
+    try {
+        emptyApprover.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'an empty approver must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('no valid identity'): e.message
+    }
+
+    [otherBuild, emptyApprover].each { def h ->
+        assert h.withCredentials.isEmpty(): 'must fail before the credentials'
+        assert !h.sh.any { it.contains('docker run') }: 'must fail before Terraform'
+    }
+}
+
+test('refuses an approval whose SHA does not match the plan') {
+    // approved for another hash
+    def approvedFor = newStep('terraformApply', [env: approvedEnv([TF_APPROVED_PLAN_SHA: PLAN_SHA]),
+                                                 files: [(APPLY_INFO_PATH): freshSidecar()],
+                                                 missing: [APPLY_MARKER],
+                                                 stdout: APPLY_SHA])
+    try {
+        approvedFor.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'an approval for another hash must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('the approval is for sha256'): e.message
+    }
+
+    // sidecar hash different from the hash published by the plan stage
+    def sidecarDiffers = newStep('terraformApply', [
+        env: approvedEnv([TF_PLAN_SHA256: PLAN_SHA, TF_APPROVED_PLAN_SHA: PLAN_SHA]),
+        files: [(APPLY_INFO_PATH): freshSidecar()],
+        missing: [APPLY_MARKER],
+        stdout: APPLY_SHA])
+    try {
+        sidecarDiffers.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'a sidecar hash mismatch must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('the sidecar says sha256='): e.message
+    }
+
+    // the file on disk was modified after the approval
+    def tampered = newStep('terraformApply', [env: approvedEnv(),
+                                              files: [(APPLY_INFO_PATH): freshSidecar()],
+                                              missing: [APPLY_MARKER],
+                                              stdout: PLAN_SHA])
+    try {
+        tampered.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'a modified plan file must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('the plan changed after it was produced'): e.message
+    }
+
+    [approvedFor, sidecarDiffers, tampered].each { def h ->
+        assert h.withCredentials.isEmpty(): 'must fail before the credentials'
+        assert !h.sh.any { it.contains('docker run') }: 'must fail before Terraform'
+    }
+}
+
+test('refuses an approval for a sidecar of another commit or root') {
+    def otherCommit = newStep('terraformApply', [env: approvedEnv(),
+                                                 files: [(APPLY_INFO_PATH): freshSidecar()
+                                                     .replace('commit=abc1234', 'commit=deadbee')],
+                                                 missing: [APPLY_MARKER],
+                                                 stdout: APPLY_SHA])
+    try {
+        otherCommit.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'a sidecar of another commit must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('another revision'): e.message
+    }
+
+    def otherRoot = newStep('terraformApply', [env: approvedEnv(),
+                                               files: [(APPLY_INFO_PATH): freshSidecar()
+                                                   .replace("root=${APPLY_ROOT}", 'root=infra/terraform/envs/stage')],
+                                               missing: [APPLY_MARKER],
+                                               stdout: APPLY_SHA])
+    try {
+        otherRoot.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'a sidecar of another root must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('the sidecar says root='): e.message
+    }
+
+    [otherCommit, otherRoot].each { def h ->
+        assert h.withCredentials.isEmpty(): 'must fail before the credentials'
+        assert !h.sh.any { it.contains('docker run') }: 'must fail before Terraform'
+    }
+}
+
+test('refuses an expired plan or an approval outside the window') {
+    // expired plan: the approval is NEWER, so what fails is the age of the plan
+    String oldPlan = java.time.Instant.now().minusSeconds(120 * 60).toString()
+    def expiredPlan = newStep('terraformApply', [env: approvedEnv(),
+                                                 files: [(APPLY_INFO_PATH): freshSidecar(oldPlan)],
+                                                 missing: [APPLY_MARKER],
+                                                 stdout: APPLY_SHA])
+    try {
+        expiredPlan.script.call(root: APPLY_ROOT, requireApproval: true, maxAgeMinutes: 60)
+        assert false: 'an expired plan must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('the plan is'): e.message
+        assert e.message.contains('more than the maximum of 60'): e.message
+        assert e.message.contains('request a new build'): e.message
+    }
+
+    // An approval older than the window is necessarily OLDER than a fresh plan
+    // (an approval is always produced after the plan), so it is caught by the
+    // temporal rule. The dedicated age branch of checkApproval stays as defence
+    // in depth: it is only reachable if `createdAt` were tampered with.
+    def oldApproval = newStep('terraformApply', [
+        env: approvedEnv([TF_APPROVED_AT: java.time.Instant.now().minusSeconds(120 * 60).toString()]),
+        files: [(APPLY_INFO_PATH): freshSidecar()],
+        missing: [APPLY_MARKER],
+        stdout: APPLY_SHA])
+    try {
+        oldApproval.script.call(root: APPLY_ROOT, requireApproval: true, maxAgeMinutes: 60)
+        assert false: 'an approval outside the window must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('older than the plan'): e.message
+        assert e.message.contains('does not correspond to this plan'): e.message
+    }
+
+    [expiredPlan, oldApproval].each { def h ->
+        assert h.withCredentials.isEmpty(): 'must fail before the credentials'
+        assert !h.sh.any { it.contains('docker run') }: 'must fail before Terraform'
+    }
+}
+
+test('refuses an invalid or future approval date or plan date') {
+    def badApprovalDate = newStep('terraformApply', [env: approvedEnv([TF_APPROVED_AT: 'not-a-date']),
+                                                     files: [(APPLY_INFO_PATH): freshSidecar()],
+                                                     missing: [APPLY_MARKER],
+                                                     stdout: APPLY_SHA])
+    try {
+        badApprovalDate.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'an invalid approval date must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('invalid TF_APPROVED_AT'): e.message
+    }
+
+    def futureApproval = newStep('terraformApply', [
+        env: approvedEnv([TF_APPROVED_AT: java.time.Instant.now().plusSeconds(300).toString()]),
+        files: [(APPLY_INFO_PATH): freshSidecar()],
+        missing: [APPLY_MARKER],
+        stdout: APPLY_SHA])
+    try {
+        futureApproval.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'a future approval date must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('approval is dated in the future'): e.message
+    }
+
+    def badPlanDate = newStep('terraformApply', [env: approvedEnv(),
+                                                 files: [(APPLY_INFO_PATH): freshSidecar('not-a-date')],
+                                                 missing: [APPLY_MARKER],
+                                                 stdout: APPLY_SHA])
+    try {
+        badPlanDate.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'an invalid plan date must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('invalid createdAt'): e.message
+    }
+
+    def futurePlan = newStep('terraformApply', [env: approvedEnv(),
+                                                files: [(APPLY_INFO_PATH): freshSidecar(
+                                                    java.time.Instant.now().plusSeconds(300).toString())],
+                                                missing: [APPLY_MARKER],
+                                                stdout: APPLY_SHA])
+    try {
+        futurePlan.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'a future plan date must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('plan is dated in the future'): e.message
+    }
+
+    [badApprovalDate, futureApproval, badPlanDate, futurePlan].each { def h ->
+        assert h.withCredentials.isEmpty(): 'must fail before the credentials'
+        assert !h.sh.any { it.contains('docker run') }: 'must fail before Terraform'
+    }
+}
+
+test('refuses an approval when the plan has no changes') {
+    Map env = applyEnv('false', [TF_PLAN_SHA256: APPLY_SHA,
+                                 TF_APPROVED_BY: 'alice',
+                                 TF_APPROVED_AT: java.time.Instant.now().minusSeconds(60).toString(),
+                                 TF_APPROVED_PLAN_SHA: APPLY_SHA,
+                                 TF_APPROVED_BUILD: '42'])
+    String sidecar = freshSidecar().replace('changes=true', 'changes=false')
+                                   .replace('status=2', 'status=0')
+    def h = newStep('terraformApply', [env: env,
+                                       files: [(APPLY_INFO_PATH): sidecar],
+                                       missing: [APPLY_MARKER],
+                                       stdout: APPLY_SHA])
+    try {
+        h.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'a plan without changes must be rejected for an approval-gated target'
+    } catch (RuntimeException e) {
+        assert e.message.contains('there is nothing to approve'): e.message
+    }
+    assert h.sh.isEmpty(): 'the gate runs before any command (no df, no hash)'
+    assert h.withCredentials.isEmpty(): 'must fail before the credentials'
+    assert !h.sh.any { it.contains('docker run') }
+}
+
+test('applies with a valid approval and records it in the evidence') {
+    def h = newStep('terraformApply', [env: approvedEnv(),
+                                       files: [(APPLY_INFO_PATH): freshSidecar()],
+                                       missing: [APPLY_MARKER],
+                                       stdout: APPLY_SHA])
+    def result = h.script.call(root: APPLY_ROOT, requireApproval: true, maxAgeMinutes: 60)
+
+    assert result.status == 'APPLIED': result
+    assert h.sh.size() == 6: "expected 6 commands, got ${h.sh.size()}"
+    assert h.sh[4].contains(' apply ')
+    assert h.withCredentials.size() == 1: 'the credential is bound only after the approval'
+    assert h.logs.any { it.contains('approval verified (by alice') }: h.logs
+
+    // the evidence carries everything the approval must be traceable by
+    String ev = h.written[APPLY_EVIDENCE]
+    assert ev != null: 'the evidence must be written'
+    assert ev.contains('Approved by : alice'): ev
+    assert ev.contains('Approved at : '): ev
+    assert ev.contains("Approved sha: ${APPLY_SHA}"): ev
+    assert ev.contains('Approved bld: 42'): ev
+    assert ev.contains('Plan age    : '): ev
+    assert ev.contains('min at apply'): ev
+    // and nothing sensitive
+    assert !ev.contains('AWS_SECRET'): ev
+    assert !ev.contains('SecretAccessKey'): ev
+    assert h.archived == [APPLY_EVIDENCE]
+}
+
+test('refuses an approval issued before the plan was created') {
+    String createdAt = java.time.Instant.now().minusSeconds(5 * 60).toString()
+    String approvedAt = java.time.Instant.now().minusSeconds(30 * 60).toString() // older
+    def h = newStep('terraformApply', [env: approvedEnv([TF_APPROVED_AT: approvedAt]),
+                                       files: [(APPLY_INFO_PATH): freshSidecar(createdAt)],
+                                       missing: [APPLY_MARKER],
+                                       stdout: APPLY_SHA])
+    try {
+        h.script.call(root: APPLY_ROOT, requireApproval: true)
+        assert false: 'an approval older than the plan must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('older than the plan'): e.message
+        assert e.message.contains('does not correspond to this plan'): e.message
+        assert e.message.contains(createdAt): 'the message must show the plan date'
+        assert e.message.contains(approvedAt): 'the message must show the approval date'
+    }
+    assert h.withCredentials.isEmpty(): 'must fail before the credentials'
+    assert !h.sh.any { it.contains('docker run') }: 'must fail before Terraform'
+}
+
+test('accepts an approval dated exactly when the plan was created') {
+    String stamp = java.time.Instant.now().minusSeconds(5 * 60).toString()
+    def h = newStep('terraformApply', [env: approvedEnv([TF_APPROVED_AT: stamp]),
+                                       files: [(APPLY_INFO_PATH): freshSidecar(stamp)],
+                                       missing: [APPLY_MARKER],
+                                       stdout: APPLY_SHA])
+    def result = h.script.call(root: APPLY_ROOT, requireApproval: true, maxAgeMinutes: 60)
+
+    assert result.status == 'APPLIED': result
+    assert h.sh.size() == 6: "expected 6 commands, got ${h.sh.size()}"
+    assert h.sh[4].contains(' apply ')
+    assert h.withCredentials.size() == 1: 'the credential is bound after the approval'
+    String ev = h.written[APPLY_EVIDENCE]
+    assert ev.contains("Approved at : ${stamp}"): ev
+    assert ev.contains('Approved by : alice'): ev
+    assert ev.contains('Plan age    : 5 min at apply'): ev
+    assert h.archived == [APPLY_EVIDENCE]
+}
+
 println 'trivyImageScan'
 String IMG_REF = 'localhost:8082/circleguard/auth-service:1.2.0-build.42.ab12cd3'
 String IMG_REPORT = 'trivy-image-report-42-localhost-8082-circleguard-auth-service-' +
@@ -1766,6 +2484,116 @@ test('accepts the Terraform apply parameters from the Jenkinsfile') {
     assert cfg.terraformImage == 'hashicorp/terraform:1.17.2'
 }
 
+// PipelineConfig constructor wrapper: reflection wraps the IllegalArgumentException
+// thrown by the validation, so the tests must unwrap the cause to assert on it.
+def newConfig = { Map m ->
+    def cls = loader.parseClass(new File(root, 'src/org/circleguard/ci/PipelineConfig.groovy'))
+    try {
+        return cls.getConstructor(Map).newInstance(m)
+    } catch (Throwable t) {
+        throw (t instanceof java.lang.reflect.InvocationTargetException && t.cause != null)
+                ? t.cause : t
+    }
+}
+
+test('keeps the Terraform approval and the PROD target disabled by default') {
+    def cfg = newConfig([:])
+
+    // approval feature: off, with safe values
+    assert cfg.terraformApproval == false: 'the approval must be off by default'
+    assert cfg.terraformApprovalTimeout == 30: cfg.terraformApprovalTimeout
+    assert cfg.terraformApprovalSubmitter == 'admin': cfg.terraformApprovalSubmitter
+    assert cfg.terraformApprovalMaxAgeMinutes == 60: cfg.terraformApprovalMaxAgeMinutes
+
+    // PROD target is declared but inert: apply AND approval are separate
+    // switches and BOTH are off, so it cannot activate by accident.
+    assert cfg.terraformApplyProdRoot == 'infra/terraform/envs/prod': cfg.terraformApplyProdRoot
+    assert cfg.terraformApplyProdBranches == ['main']: cfg.terraformApplyProdBranches
+    assert cfg.terraformApplyProd == false: 'PROD apply must be off by default'
+    assert cfg.terraformApprovalProd == false: 'PROD approval must be off by default'
+
+    // the DEV scope of the previous phase is unchanged
+    assert cfg.terraformApply == false
+    assert cfg.terraformApplyRoot == 'infra/terraform/envs/dev'
+    assert cfg.terraformApplyBranches == ['dev']
+    assert cfg.terraformPlan == false
+}
+
+test('accepts an explicit Terraform approval configuration from the Jenkinsfile') {
+    def cfg = newConfig([terraformApproval: true,
+                         terraformApprovalTimeout: 45,
+                         terraformApprovalSubmitter: 'sre,platform',
+                         terraformApprovalMaxAgeMinutes: 15,
+                         terraformApplyProd: true,
+                         terraformApprovalProd: true,
+                         terraformApplyProdRoot: 'infra/terraform/envs/prod',
+                         terraformApplyProdBranches: ['main']])
+
+    assert cfg.terraformApproval == true
+    assert cfg.terraformApprovalTimeout == 45
+    assert cfg.terraformApprovalSubmitter == 'sre,platform'
+    assert cfg.terraformApprovalMaxAgeMinutes == 15
+    assert cfg.terraformApplyProd == true
+    assert cfg.terraformApprovalProd == true
+    assert cfg.terraformApplyProdRoot == 'infra/terraform/envs/prod'
+    assert cfg.terraformApplyProdBranches == ['main']
+
+    // untouched defaults keep their value
+    assert cfg.terraformApply == false
+    assert cfg.terraformApplyRoot == 'infra/terraform/envs/dev'
+    assert cfg.terraformApplyBranches == ['dev']
+    assert cfg.terraformPlan == false
+    assert cfg.terraformApplyTimeout == 30
+}
+
+test('rejects an invalid Terraform approval configuration') {
+    // timeout 0: must NOT be swallowed by the default (0 is falsy in Groovy)
+    try {
+        newConfig([terraformApprovalTimeout: 0])
+        assert false: 'a timeout of 0 must be rejected'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains('terraformApprovalTimeout must be > 0'): e.message
+    }
+
+    try {
+        newConfig([terraformApprovalTimeout: -5])
+        assert false: 'a negative timeout must be rejected'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains('terraformApprovalTimeout must be > 0'): e.message
+    }
+
+    try {
+        newConfig([terraformApprovalMaxAgeMinutes: 0])
+        assert false: 'a max age of 0 must be rejected'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains('terraformApprovalMaxAgeMinutes must be > 0'): e.message
+    }
+
+    try {
+        newConfig([terraformApprovalMaxAgeMinutes: -1])
+        assert false: 'a negative max age must be rejected'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains('terraformApprovalMaxAgeMinutes must be > 0'): e.message
+    }
+
+    try {
+        newConfig([terraformApprovalSubmitter: ''])
+        assert false: 'an empty submitter must be rejected'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains('terraformApprovalSubmitter must not be empty'): e.message
+    }
+
+    try {
+        newConfig([terraformApprovalSubmitter: '   '])
+        assert false: 'a blank submitter must be rejected'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains('terraformApprovalSubmitter must not be empty'): e.message
+    }
+
+    // the valid defaults still build without error
+    assert newConfig([:]).terraformApprovalTimeout == 30
+}
+
 println 'circleguardPipeline (integration, source level)'
 test('still compiles with the new stages') {
     // a child loader so that PipelineConfig is visible to the import of the entry point
@@ -1814,7 +2642,7 @@ test('declares the Terraform plan stage between Trivy and Publish, gated to dev'
     assert block.contains('credentialsId: cfg.terraformAwsCredentialsId')
     assert block.contains('region: cfg.terraformAwsRegion')
     assert block.contains('minFreeSpaceMB: cfg.terraformMinFreeSpaceMB')
-    assert !block.contains('terraformApply'): 'apply is not part of this phase'
+    assert !block.contains('terraformApply('): 'the plan stages must not run apply'
 }
 
 test('passes the Trivy Image configuration to publishImages') {
@@ -1843,6 +2671,7 @@ test('persists the plan result and applies it after the plan, before Publish ima
     assert text.contains('env.TF_PLAN_ROOT = plan.root')
     assert text.contains('env.TF_PLAN_FILE = plan.planFile')
     assert text.contains('env.TF_PLAN_INFO = plan.planInfo')
+    assert text.contains('env.TF_PLAN_SHA256 = plan.sha256')
     assert text.contains('env.TF_PLAN_CHANGES = plan.changes.toString()')
 
     int plan = text.indexOf("stage('Terraform plan')")
@@ -1854,9 +2683,11 @@ test('persists the plan result and applies it after the plan, before Publish ima
     String block = text.substring(apply, publish)
     // flag AND branch: PRs never receive the AWS credential
     assert block.contains('cfg.terraformApply && cfg.terraformApplyBranches.contains(env.BRANCH_NAME)')
-    // stage budget is 2x the command timeout; the whole build gets 120 minutes
+    // stage budget is 2x the command timeout; the whole-build budget is a single
+    // source of truth, also used by the guard of the approval stage
     assert block.contains('timeout(time: cfg.terraformApplyTimeout * 2, unit:')
-    assert text.contains("timeout(time: 120, unit: 'MINUTES')")
+    assert text.contains('final int pipelineTimeoutMinutes = 120')
+    assert text.contains('timeout(time: pipelineTimeoutMinutes, unit:')
     assert block.contains('root: cfg.terraformApplyRoot')
     assert block.contains('credentialsId: cfg.terraformAwsCredentialsId')
     assert block.contains('region: cfg.terraformAwsRegion')
@@ -1900,6 +2731,319 @@ test('keeps every pre-existing stage') {
     assert text.contains('disableConcurrentBuilds()'): 'builds must queue, not abort'
     assert !text.contains('abortPrevious'):
         'abortPrevious must never cancel a running build or approval'
+}
+
+println 'terraform targets & approval (S5)'
+
+test('maps each branch to a fixed target, with no arbitrary branch/root pairing') {
+    def cfg = newConfig([:])
+    def h = newStep('circleguardPipeline')
+
+    assert h.script.terraformTarget(cfg, 'dev') == [name: 'dev',
+                                                    root: 'infra/terraform/envs/dev']
+    assert h.script.terraformTarget(cfg, 'main') == [name: 'prod',
+                                                     root: 'infra/terraform/envs/prod']
+    // a DEV branch never resolves to the PROD target (and PROD only from main)
+    assert h.script.terraformTarget(cfg, 'dev')?.name != 'prod'
+    // PRs and feature branches drive no target at all
+    assert h.script.terraformTarget(cfg, 'PR-7') == null
+    assert h.script.terraformTarget(cfg, 'feature/x') == null
+    assert h.script.terraformTarget(cfg, null) == null
+}
+
+test('rejects a PROD target outside main and a branch configured for both targets') {
+    def h = newStep('circleguardPipeline')
+
+    def prodElsewhere = newConfig([terraformApplyProdBranches: ['staging']])
+    try {
+        h.script.terraformTarget(prodElsewhere, 'staging')
+        assert false: 'PROD from a branch other than main must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains("only allowed from 'main'"): e.message
+        assert e.message.contains('infra/terraform/envs/prod'): 'the message must name the root'
+    }
+
+    def both = newConfig([terraformApplyBranches: ['dev'],
+                          terraformApplyProdBranches: ['dev']])
+    try {
+        h.script.terraformTarget(both, 'dev')
+        assert false: 'a branch configured for both targets must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('BOTH'): e.message
+        assert e.message.contains('refusing to pick a root arbitrarily'): e.message
+    }
+}
+
+test('keeps the DEV flow and never calls the approval from it') {
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+    int devPlan = text.indexOf("stage('Terraform plan')")
+    int devApply = text.indexOf("stage('Terraform apply')")
+    int prodApply = text.indexOf("stage('Terraform apply PROD')")
+    assert devPlan > 0 && devApply > devPlan && prodApply > devApply
+
+    String devPlanBlock = text.substring(devPlan, devApply)
+    assert devPlanBlock.contains('Map plan = terraformPlan(')
+    assert devPlanBlock.contains('root: cfg.terraformPlanRoot')
+    assert devPlanBlock.contains('cfg.terraformPlan && cfg.terraformPlanBranches.contains(env.BRANCH_NAME)')
+
+    String devApplyBlock = text.substring(devApply, prodApply)
+    assert devApplyBlock.contains('cfg.terraformApply && cfg.terraformApplyBranches.contains(env.BRANCH_NAME)')
+    assert devApplyBlock.contains('root: cfg.terraformApplyRoot')
+    assert devApplyBlock.contains('requireApproval: false'): 'DEV must state that it needs no approval'
+    assert !devApplyBlock.contains('requireApproval: true')
+    assert !devApplyBlock.contains('terraformApproval('): 'DEV never invokes the approval step'
+}
+
+test('requests the approval for PROD between the plan and the apply') {
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+    int planProd = text.indexOf("stage('Terraform plan PROD')")
+    int approval = text.indexOf("stage('Terraform approval')")
+    int applyProd = text.indexOf("stage('Terraform apply PROD')")
+    int publish = text.indexOf("stage('Publish images')")
+    assert planProd > 0 && approval > planProd && applyProd > approval && publish > applyProd:
+        "wrong order: planProd=${planProd} approval=${approval} applyProd=${applyProd} publish=${publish}"
+
+    String planBlock = text.substring(planProd, approval)
+    assert planBlock.contains('cfg.terraformApplyProd && cfg.terraformPlan &&')
+    assert planBlock.contains("terraformTarget(cfg, env.BRANCH_NAME)?.name == 'prod'")
+    assert planBlock.contains('root: target.root'): 'the PROD root comes from the resolved target'
+    assert planBlock.contains('env.TF_PLAN_SHA256 = plan.sha256')
+
+    String approvalBlock = text.substring(approval, applyProd)
+    assert approvalBlock.contains('cfg.terraformApproval && cfg.terraformApprovalProd')
+    assert approvalBlock.contains("terraformTarget(cfg, env.BRANCH_NAME)?.name == 'prod'")
+    assert approvalBlock.contains("env.TF_PLAN_CHANGES == 'true'"): 'no approval without changes'
+    assert approvalBlock.contains('requireApprovalTimeLeft(pipelineStartedAtMs, pipelineTimeoutMinutes,')
+    assert approvalBlock.contains('submitter: cfg.terraformApprovalSubmitter')
+    assert approvalBlock.contains('timeout: cfg.terraformApprovalTimeout')
+    assert approvalBlock.contains('maxAgeMinutes: cfg.terraformApprovalMaxAgeMinutes')
+    assert approvalBlock.contains('env.TF_APPROVED_TARGET = target.name')
+    assert !approvalBlock.contains('catchError'): 'an interrupted approval must stop the pipeline'
+    assert !approvalBlock.contains('try {'): 'nothing about the approval is swallowed'
+
+    // with the approval switches ON, main resolves to the PROD target
+    def cfgOn = newConfig([terraformApproval: true, terraformApprovalProd: true,
+                           terraformApplyProd: true])
+    def h = newStep('circleguardPipeline')
+    assert h.script.terraformTarget(cfgOn, 'main')?.name == 'prod'
+}
+
+test('gates the PROD apply on the approval and passes the approval settings') {
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+    int applyProd = text.indexOf("stage('Terraform apply PROD')")
+    int publish = text.indexOf("stage('Publish images')")
+    assert applyProd > 0 && publish > applyProd
+    String block = text.substring(applyProd, publish)
+
+    assert block.contains('cfg.terraformApplyProd && env.TF_PLAN_CHANGES ==')
+    assert block.contains("terraformTarget(cfg, env.BRANCH_NAME)?.name == 'prod'")
+    assert block.contains("env.TF_APPROVED_TARGET != 'prod'"):
+        'an explicit refusal when no approval was recorded'
+    assert block.contains('Nothing will be applied')
+    assert block.contains('requireApproval: true')
+    assert block.contains('maxAgeMinutes: cfg.terraformApprovalMaxAgeMinutes')
+    assert block.contains('root: target.root')
+}
+
+test('does not request the approval without a full window left') {
+    def h = newStep('circleguardPipeline')
+    long now = System.currentTimeMillis()
+
+    // 95 min elapsed of a 120 min budget -> 25 min left, less than the 30 required
+    try {
+        h.script.requireApprovalTimeLeft(now - 95L * 60_000L, 120, 30, now)
+        assert false: 'an insufficient budget must fail before the input'
+    } catch (RuntimeException e) {
+        assert e.message.contains('NOT requesting the approval'): e.message
+        assert e.message.contains('NOT applying anything'): e.message
+        assert e.message.contains('25 minute(s) left'): e.message
+    }
+    assert h.sh.isEmpty(): 'nothing must run'
+
+    // 10 min elapsed -> 110 min left, plenty of room for a 30 minute approval
+    h.script.requireApprovalTimeLeft(now - 10L * 60_000L, 120, 30, now)
+    assert h.logs.any { it.contains('110 minute(s) left of the 120-minute build budget') }: h.logs
+}
+
+test('keeps the image publishing stage unchanged') {
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+    int publish = text.indexOf("stage('Publish images')")
+    int deploy = text.indexOf("stage('Deploy')")
+    assert publish > 0 && deploy > publish
+    String block = text.substring(publish, deploy)
+
+    assert block.contains('cfg.publish && cfg.publishBranches.contains(env.BRANCH_NAME)')
+    assert block.contains('scanVulnerabilities: cfg.trivyImageScan')
+    assert block.contains('registry: cfg.registry')
+    assert block.contains('images: cfg.images')
+    assert !block.contains('terraformApproval')
+    assert !block.contains('requireApproval')
+    assert !block.contains('Terraform')
+}
+
+test('PROD approval and apply are disabled by default and gated by their switches') {
+    def cfg = newConfig([:])
+    assert cfg.terraformApplyProd == false: 'PROD apply must stay off'
+    assert cfg.terraformApproval == false: 'the approval must stay off'
+    assert cfg.terraformApprovalProd == false: 'the PROD approval must stay off'
+    assert cfg.terraformApplyProdRoot == 'infra/terraform/envs/prod'
+    assert cfg.terraformApplyProdBranches == ['main']
+
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+    String approvalBlock = text.substring(text.indexOf("stage('Terraform approval')"),
+                                          text.indexOf("stage('Terraform apply PROD')"))
+    // both switches are required, so the stage cannot be selected with the defaults
+    assert approvalBlock.contains('cfg.terraformApproval && cfg.terraformApprovalProd')
+    String planBlock = text.substring(text.indexOf("stage('Terraform plan PROD')"),
+                                      text.indexOf("stage('Terraform approval')"))
+    assert planBlock.contains('cfg.terraformApplyProd && cfg.terraformPlan &&')
+    assert planBlock.contains("terraformTarget(cfg, env.BRANCH_NAME)?.name == 'prod'")
+}
+
+println 'approval window & gate (S5 corrections)'
+
+// Extracts the `when { ... }` of a stage so its conditions can be asserted as text
+def stageWhen = { String text, String name ->
+    int start = text.indexOf("stage('${name}')")
+    assert start > 0: "stage ${name} not found"
+    int end = text.indexOf('options {', start)
+    assert end > start: "options of ${name} not found"
+    text.substring(start, end)
+}
+String pipelineSource = new File(root, 'vars/circleguardPipeline.groovy').text
+
+test('allows the approval with exactly the required window left') {
+    def h = newStep('circleguardPipeline')
+    long now = System.currentTimeMillis()
+    // 120 min budget - 90 min elapsed = exactly 30 min left == the window
+    long started = now - (120L * 60_000L - 30L * 60_000L)
+    h.script.requireApprovalTimeLeft(started, 120, 30, now)
+    assert h.logs.any { it.contains('30 minute(s) left of the 120-minute build budget') }: h.logs
+}
+
+test('allows the approval with 30 minutes and 1 millisecond left') {
+    def h = newStep('circleguardPipeline')
+    long now = System.currentTimeMillis()
+    long started = now - (120L * 60_000L - (30L * 60_000L + 1L))   // 1 ms of margin
+    h.script.requireApprovalTimeLeft(started, 120, 30, now)        // must NOT throw
+    assert h.logs.any { it.contains('minute(s) left of the 120-minute build budget') }: h.logs
+    assert h.sh.isEmpty(): 'nothing must run'
+}
+
+test('rejects the approval with 29 minutes and 59 seconds left') {
+    def h = newStep('circleguardPipeline')
+    long now = System.currentTimeMillis()
+    long started = now - (120L * 60_000L - (29L * 60_000L + 59L * 1000L))
+    try {
+        h.script.requireApprovalTimeLeft(started, 120, 30, now)
+        assert false: 'one second short of the window must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('29 minute(s) left'): e.message
+        assert e.message.contains('NOT requesting the approval'): e.message
+        assert e.message.contains('NOT applying anything'): e.message
+    }
+    assert h.sh.isEmpty(): 'nothing must run'
+}
+
+test('rejects the approval with 29 minutes and 59.999 seconds left') {
+    def h = newStep('circleguardPipeline')
+    long now = System.currentTimeMillis()
+    long started = now - (120L * 60_000L - (29L * 60_000L + 59_999L))
+    try {
+        h.script.requireApprovalTimeLeft(started, 120, 30, now)
+        assert false: 'a millisecond short of the window must be rejected'
+    } catch (RuntimeException e) {
+        // the decision used exact milliseconds; the message only rounds down
+        assert e.message.contains('29 minute(s) left'): e.message
+        assert e.message.contains('NOT requesting the approval'): e.message
+    }
+    assert h.sh.isEmpty(): 'nothing must run'
+}
+
+test('rejects a non positive budget or approval window') {
+    def h = newStep('circleguardPipeline')
+    long now = System.currentTimeMillis()
+
+    [[0, 30], [-5, 30], [120, 0], [120, -1]].each { List<Integer> pair ->
+        int budget = pair[0]
+        int approval = pair[1]
+        try {
+            h.script.requireApprovalTimeLeft(now - 60_000L, budget, approval, now)
+            assert false: "budget=${budget} approval=${approval} must be rejected"
+        } catch (RuntimeException e) {
+            if (budget <= 0) {
+                assert e.message.contains('build budget must be > 0 minutes'): e.message
+            } else {
+                assert e.message.contains('approval window must be > 0 minutes'): e.message
+            }
+        }
+    }
+    assert h.sh.isEmpty(): 'nothing must run'
+}
+
+test('rejects a negative elapsed time') {
+    def h = newStep('circleguardPipeline')
+    long now = System.currentTimeMillis()
+    try {
+        h.script.requireApprovalTimeLeft(now + 60_000L, 120, 30, now)  // started in the future
+        assert false: 'a negative elapsed time must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('elapsed time is negative'): e.message
+    }
+    assert h.sh.isEmpty(): 'nothing must run'
+}
+
+test('does not request the approval when the PROD apply switch is off') {
+    String gate = stageWhen(pipelineSource, 'Terraform approval')
+    // even with BOTH approval switches on, the stage cannot activate without it
+    assert gate.contains('cfg.terraformApplyProd'): gate
+    assert gate.contains('cfg.terraformApproval && cfg.terraformApprovalProd'): gate
+    def cfg = newConfig([terraformApproval: true, terraformApprovalProd: true])
+    assert cfg.terraformApproval == true
+    assert cfg.terraformApprovalProd == true
+    assert cfg.terraformApplyProd == false: 'the PROD apply switch stays off by default'
+}
+
+test('requests the approval with the three switches, the PROD target and changes') {
+    String gate = stageWhen(pipelineSource, 'Terraform approval')
+    assert gate.contains('cfg.terraformApplyProd && cfg.terraformApproval && cfg.terraformApprovalProd'): gate
+    assert gate.contains("terraformTarget(cfg, env.BRANCH_NAME)?.name == 'prod'"): gate
+    assert gate.contains("env.TF_PLAN_CHANGES == 'true'"): gate
+
+    def cfgOn = newConfig([terraformApproval: true, terraformApprovalProd: true,
+                           terraformApplyProd: true])
+    def h = newStep('circleguardPipeline')
+    assert h.script.terraformTarget(cfgOn, 'main')?.name == 'prod': 'main must resolve to PROD'
+}
+
+test('never requests the approval for DEV') {
+    String gate = stageWhen(pipelineSource, 'Terraform approval')
+    assert gate.contains("terraformTarget(cfg, env.BRANCH_NAME)?.name == 'prod'"): gate
+
+    def h = newStep('circleguardPipeline')
+    assert h.script.terraformTarget(newConfig([:]), 'dev')?.name == 'dev': 'dev resolves to DEV'
+    assert h.script.terraformTarget(newConfig([:]), 'dev')?.name != 'prod'
+}
+
+test('never requests the approval when the plan has no changes') {
+    String gate = stageWhen(pipelineSource, 'Terraform approval')
+    assert gate.contains("env.TF_PLAN_CHANGES == 'true'"): gate
+
+    // the apply stage carries the same condition, so it cannot run either
+    String applyGate = pipelineSource.substring(pipelineSource.indexOf("stage('Terraform apply PROD')"),
+                                                pipelineSource.indexOf("stage('Publish images')"))
+    assert applyGate.contains("env.TF_PLAN_CHANGES == 'true'"):
+        'the PROD apply must be gated on the changes as well'
+}
+
+test('the PROD apply cannot run without a recorded approval') {
+    String applyBlock = pipelineSource.substring(pipelineSource.indexOf("stage('Terraform apply PROD')"),
+                                                 pipelineSource.indexOf("stage('Publish images')"))
+    assert applyBlock.contains("env.TF_APPROVED_TARGET != 'prod'"): 'explicit refusal'
+    assert applyBlock.contains('Nothing will be applied')
+    assert applyBlock.contains('requireApproval: true')
+    assert applyBlock.contains('maxAgeMinutes: cfg.terraformApprovalMaxAgeMinutes')
+    assert applyBlock.contains('cfg.terraformApplyProd')
 }
 
 println 'runE2E'
@@ -2037,7 +3181,9 @@ test('documents the terraform apply step in the READMEs') {
     assert readme.contains('| `terraformApplyRoot` |')
     assert readme.contains('| `terraformApplyBranches` |')
     assert readme.contains('| `terraformApplyTimeout` |')
-    assert readme.contains('## Terraform apply (DEV only)'): 'the section must exist'
+    assert readme.contains('## Terraform apply'): 'the section must exist'
+    assert readme.contains('### PROD target and approval (S5)'): 'the PROD section must exist'
+    assert readme.contains('requireApprovalTimeLeft'): 'the budget guard must be documented'
     assert readme.contains('disableConcurrentBuilds()'): 'the queued behaviour must be documented'
     assert readme.contains('abortPrevious'): 'the removed option must be documented'
     assert !readme.contains('disableConcurrentBuilds(abortPrevious: true)'):
