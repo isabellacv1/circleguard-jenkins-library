@@ -78,7 +78,12 @@ circleguardPipeline(
 | `terraformValidateTimeout` | `15` | Terraform stage timeout (minutes). |
 | `terraformMinFreeSpaceMB` | `1500` | Free space (MB) required in the workspace **before** any Terraform command runs. |
 | `trivyScan` | `false` | Runs `trivy config`; a HIGH/CRITICAL finding fails the build. |
-| `trivyImage` | `aquasec/trivy:0.76.2` | Pinned Trivy image. |
+| `trivyImage` | `aquasec/trivy:0.76.2` | Pinned image of the Trivy **tool** (the scanner) used by the IaC scan **and** by the image scan. It is **not** the image being scanned. |
+| `trivyImageScan` | `false` | Scans every image **between `docker build` and `docker push`** and blocks on HIGH/CRITICAL (opt-in, runs inside `Publish images`). |
+| `trivyImageSeverity` | `HIGH,CRITICAL` | Severities that block the publication of an image (configured apart from `trivySeverity`, which is for the IaC scan). |
+| `trivyImageBranches` | `['dev', 'main']` | Branches that scan before pushing (⊆ `publishBranches`; PRs never reach the stage). The scan requires `env.BRANCH_NAME` to exist **and** to be listed here: a missing or unlisted branch skips it. |
+| `trivyImageTimeout` | `15` | Timeout of a single image scan (minutes). |
+| `trivyImageIgnoreFile` | `.trivyignore.yaml` | Ignore file with the documented exceptions (the same file as the IaC scan, section `vulnerabilities:`). Passed with `--ignorefile` only when it exists. |
 | `trivyPaths` | `['infra/terraform']` | Directories scanned (Trivy accepts one target per invocation). |
 | `trivySeverity` | `HIGH,CRITICAL` | Severities that block the build. |
 | `trivyTimeout` | `15` | Trivy stage timeout (minutes). |
@@ -88,6 +93,10 @@ circleguardPipeline(
 | `terraformAwsCredentialsId` | `aws-terraform-credentials` | Username/password credential (Access Key ID / Secret Access Key) bound with `withCredentials` only around the Terraform commands. |
 | `terraformAwsRegion` | `us-east-1` | Value of `AWS_DEFAULT_REGION`, injected by name. |
 | `terraformPlanTimeout` | `20` | Plan stage budget and per-command timeout (minutes). |
+| `terraformApply` | `false` | Applies **the plan of the same build** with `terraform apply -lock=true` (DEV only in this phase; STAGE/PROD not enabled). |
+| `terraformApplyRoot` | `infra/terraform/envs/dev` | Single root applied. Independent from `terraformPlanRoot`, so enabling another environment is always an explicit decision. |
+| `terraformApplyBranches` | `['dev']` | Branches that apply. **PRs and every other branch are excluded** (the stage requires the flag AND the branch). |
+| `terraformApplyTimeout` | `30` | Apply command timeout; the stage budget is `2 ×` this value (init + apply). |
 
 ### Stages
 
@@ -100,8 +109,9 @@ circleguardPipeline(
 | SonarQube | analysis + quality gate (if `sonar`) |
 | Terraform validate | `fmt -check`, `init -backend=false` and `validate` of every Terraform root (if `terraformValidate`) |
 | Trivy IaC | `trivy config` of `trivyPaths`; HIGH/CRITICAL findings fail the build and the report is archived (if `trivyScan`) |
-| Terraform plan | `terraform init -backend=true` + `terraform plan -detailed-exitcode -out=<root>/ci-<env>.tfplan` against the real S3 backend, with `aws-terraform-credentials` injected **by name** (if `terraformPlan` and branch in `terraformPlanBranches`) |
-| Publish images | `docker build` + `docker push` of every image (if `publish` and branch in `publishBranches`) |
+| Terraform plan | `terraform init -backend=true` + `terraform plan -detailed-exitcode -out=<root>/ci-<env>-b<build>.tfplan` against the real S3 backend, with `aws-terraform-credentials` injected **by name** (if `terraformPlan` and branch in `terraformPlanBranches`) |
+| Terraform apply | `terraform init -backend=true` + `terraform apply -lock=true ci-<env>-b<build>.tfplan`, the plan of **this** build only (if `terraformApply` and branch in `terraformApplyBranches`) |
+| Publish images | `docker build` + `docker push` of every image (if `publish` and branch in `publishBranches`); each image is scanned with Trivy **between the build and the push** when `trivyImageScan` is enabled |
 | Deploy | Copies the compose files to the target host over SSH and runs `docker compose up -d --wait` with the published images (if `deploy` and branch in `deployBranches`) |
 | Verify deployment | HTTP check of every component with retries; the build fails if a service does not answer (if `deploy`) |
 | E2E tests | Playwright tests in a container against the deployed `dev` (condition to promote, if `e2e`) |
@@ -130,10 +140,10 @@ circleguardPipeline(
 
 ### Workspace isolation
 
-`runInContainer` does **not** mount the whole `circleguard-jenkins-home` volume
-(which holds `credentials.xml`, `secrets/` and the workspaces of every other
-job). It mounts **only the workspace of the job**, with the `volume-subpath`
-option of `--mount`:
+`runInContainer` and `runE2E` do **not** mount the whole `circleguard-jenkins-home`
+volume (which holds `credentials.xml`, `secrets/` and the workspaces of every
+other job). They mount **only the workspace of the job**, with the
+`volume-subpath` option of `--mount`:
 
 ```bash
 docker run --rm --user $(id -u):$(id -g) -e HOME=/tmp \
@@ -141,17 +151,20 @@ docker run --rm --user $(id -u):$(id -g) -e HOME=/tmp \
   -w '/ws' <image> <command>
 ```
 
-The workspace root is `/ws` inside the container, so steps that need a path in
-the workspace (Trivy cache, Terraform plugin cache) use `/ws/...`. Two guards run
-before the mount: the workspace must live under `/var/jenkins_home/workspace/`
-and it must already exist (it is created by `Checkout`, the first stage).
+The workspace root is `/ws` inside the container (`/jh` in `runE2E`, whose
+working directory is `/jh/tests/e2e-playwright`), so steps that need a path in
+the workspace (Trivy cache, Terraform plugin cache, the Playwright project) use
+that root. Two guards run before the mount: the workspace must live under
+`/var/jenkins_home/workspace/` and it must already exist (it is created by
+`Checkout`, the first stage).
 
 > ⚠ **`volume-subpath` still needs a real `docker run` to be validated.** It is
 > documented by the Docker Engine and supported by the Docker 29.9.3 of the
 > host, but no container has been executed yet in this environment. If the mount
 > fails, the documented fallback is the previous behaviour: mount the whole
 > volume (`-v circleguard-jenkins-home:/jh`) and translate `/var/jenkins_home/...`
-> to `/jh/...` — which is still what `runE2E` does.
+> to `/jh/...` — used only as an emergency fallback: since the `runE2E` change,
+> **no step mounts the whole volume anymore**.
 
 Rules enforced by the steps:
 
@@ -252,8 +265,9 @@ for example `gradlew 'build'` or `publishTestReports()`.
 
 Optional stage (`terraformPlan: false` by default) that runs a **real plan for
 one root, on the `dev` branch only**, and keeps the saved plan in the workspace
-of the same build. It never runs `apply`, never archives the plan and never
-changes the Terraform roots.
+of the same build. The plan itself never runs `apply` (that is the separate
+`Terraform apply` stage below), never archives the plan and never changes the
+Terraform roots.
 
 ```groovy
 circleguardPipeline(
@@ -296,12 +310,18 @@ resource involved**: the IAM policies are never widened to make a build pass.
 
 ### The plan file
 
-- Lives at `<root>/ci-<env>.tfplan` (e.g. `infra/terraform/envs/dev/ci-dev.tfplan`).
+- Lives at `<root>/ci-<env>-b<build>.tfplan` (e.g.
+  `infra/terraform/envs/dev/ci-dev-b47.tfplan`): **the build number is part of
+  the name**, so the plan of another build cannot be applied by mistake.
+- Next to it, `<plan>.info` records `build`, `commit`, `root`, `changes`,
+  `status`, `sha256` and `createdAt` — the provenance that `terraformApply`
+  validates. The `sha256` is computed with `sha256sum`: **without that tool the
+  plan step fails closed** and leaves no sidecar.
 - It is **not archived**: it must not be downloadable, only reviewable in the
-  workspace of the same build (a future apply phase reads it from there).
+  workspace of the same build (the `Terraform apply` stage reads it from there).
 - The extension is ignored by `.gitignore` (`*.tfplan`), so it can never be committed.
-- The plan of a previous build is deleted (`rm -f`) before the run, so an old
-  plan can never be reused.
+- The plan of a previous build (and its sidecar) is deleted (`rm -f`) before the
+  run, so an old plan can never be reused.
 
 ### Reuse and guards
 
@@ -322,15 +342,195 @@ resource involved**: the IAM policies are never widened to make a build pass.
   Terraform `>= 1.10`. The image is pinned to `1.17.2`, so the run works, but the
   constraint does not enforce it. **Recommendation: raise `required_version` to
   `>= 1.10` in `envs/{dev,stage,prod}/versions.tf`** — not changed in this phase.
-- **`disableConcurrentBuilds(abortPrevious: true)`**: a new build aborts the
-  previous one. For a future apply stage waiting on a manual `input`, an incoming
-  build cancels the pending approval (the apply then never runs — fail-safe, but
-  the approver must know it). To be decided before the apply phase.
+- **Builds queue, nothing is aborted**: `circleguardPipeline` uses
+  `disableConcurrentBuilds()` without `abortPrevious`, so a newer push waits for
+  the running build instead of cancelling it (see *Concurrency: builds queue*
+  below). A plan or an apply in progress is never interrupted by a new push.
 - **IAM permissions are not validated yet**: if the first real plan reports
   `AccessDenied`, report the action and the resource. Known candidates from the
   IAM simulation are `s3:ListBucket` without `s3:prefix`, `ec2:DescribeVolumes`,
   `ec2:DescribeTags`, `ec2:DescribeVpcSecurityGroupRules` and
   `dlm:GetLifecyclePolicies`. Never widen the policies from a build failure.
+
+## Image vulnerabilities (Trivy Image)
+
+Optional, **off by default** (`trivyImageScan: false`). When it is enabled, every
+image built by `Publish images` is scanned with Trivy **between `docker build`
+and `docker push`**, so a HIGH/CRITICAL finding never reaches the registry.
+
+```groovy
+circleguardPipeline(
+    // ...
+    trivyImageScan: true
+)
+```
+
+| Step | Image (pinned) | Command |
+|------|----------------|---------|
+| `trivyImageScan` | `aquasec/trivy:0.76.2` (the **tool**) | `docker run --rm … aquasec/trivy:0.76.2 image --severity HIGH,CRITICAL --exit-code 1 --pull never --format table --output trivy-image-report-<build>-<slug>.txt --cache-dir /ws/.trivy-cache [--ignorefile .trivyignore.yaml] <ref>` |
+
+### How the local image is read
+
+- The image is tagged in the Docker daemon of the host
+  (`localhost:8082/<name>:<version>`), so the container talks to the daemon
+  through a **bind mount of `/var/run/docker.sock`**, and `--pull never` stops
+  Trivy from reaching `localhost:8082` from inside the container (where
+  `localhost` would be the container itself).
+- The workspace is mounted with the same `volume-subpath` pattern as
+  `runInContainer`, so the report lands in the workspace of the job and the
+  container never reaches `credentials.xml`, `secrets/` or another job's
+  workspace.
+- The Trivy database and cache live in `/ws/.trivy-cache`, shared with the IaC
+  scan (downloaded once, scanned sequentially).
+- **No credentials are needed**: the image is local and the database is public.
+  The `ref`, the severity and the ignore file are validated before being put in
+  a command line.
+
+### Threshold and exceptions
+
+- `--severity HIGH,CRITICAL --exit-code 1`: any finding blocks the build, exactly
+  like the IaC scan. **No `--ignore-unfixed`.**
+- Documented exceptions live in the project's `.trivyignore.yaml`
+  (`vulnerabilities:` section, with `statement` and `expired_at`), the same file
+  used for the IaC scan, and are passed with `--ignorefile` **only when the file
+  exists**. Exceptions are decided after reviewing real results.
+
+### Evidence
+
+- The report `trivy-image-report-<build>-<slug>.txt` is unique per build **and**
+  per image (a report of a previous build is never archived: it is removed with
+  `rm -f` first), is **echoed and archived before the step fails**, and the
+  failure message points to the report and to the ignore file.
+
+### Gating and publication
+
+- Two gates: the opt-in flag `trivyImageScan` **and** a branch in
+  `trivyImageBranches` (default `['dev', 'main']`); the stage itself is already
+  restricted by `publishBranches`, so **PRs neither scan nor publish**. The scan
+  additionally requires `env.BRANCH_NAME` to exist **and** to be listed in
+  `trivyImageBranches`: a missing or unlisted branch skips the scan (the
+  publication continues without it).
+- The scan runs **inside** `Publish images`: a failure skips the `push` of that
+  image and the registry session is still closed (`finally`). The images pushed
+  before the failing one stay in the registry — **partial publication is
+  accepted**, because the version is unique to the build and the deployment needs
+  every image of that version (a missing image fails at deploy time).
+
+### Known limitations and follow-ups
+
+- **`--pull never` has not been executed in this environment**: confirm it in the
+  first real build (`trivy image --help`). If it were unsupported the failure is
+  visible, and the fallback is `docker save` + `trivy image --input`.
+- **The Docker socket is mounted into the pinned Trivy container** for the
+  duration of the scan (root-equivalent on the host). Mitigations: the tool image
+  is pinned (never `latest`) and the container is `--rm`.
+- The scan adds time to the `publish` stage (40 min for 9 images) and the first
+  run downloads the database (~50 MB) into the shared cache.
+
+## Terraform apply (DEV only)
+
+Optional stage (`terraformApply: false` by default) that applies **the plan
+produced by the `Terraform plan` stage of the SAME build**. STAGE and PROD are
+**not enabled** in this phase.
+
+```groovy
+circleguardPipeline(
+    // ...
+    terraformPlan: true,
+    terraformApply: true      // root, branch and credential come from the defaults
+)
+```
+
+| Step | Image (pinned) | Commands |
+|------|----------------|----------|
+| `terraformApply` | `hashicorp/terraform:1.17.2` | `terraform init -backend=true -no-color -input=false` · `terraform apply -no-color -input=false -lock=true ci-<env>-b<build>.tfplan` (workdir = the root) |
+
+### Provenance: only the plan of this build
+
+The plan is named **`ci-<env>-b<build>.tfplan`** and `terraformPlan` writes a
+sidecar **`<plan>.info`** with `build`, `commit`, `root`, `changes`, `status`
+and `createdAt`. The plan stage also publishes `env.TF_PLAN_BUILD`,
+`env.TF_PLAN_ROOT`, `env.TF_PLAN_FILE`, `env.TF_PLAN_INFO` and
+`env.TF_PLAN_CHANGES`. Before running anything, `terraformApply` verifies:
+
+1. `env.TF_PLAN_BUILD` exists and equals `env.BUILD_NUMBER`;
+2. `env.TF_PLAN_ROOT`, `env.TF_PLAN_FILE` and `env.TF_PLAN_INFO` match the target;
+3. `env.TF_PLAN_CHANGES` is `true`/`false` and matches the sidecar;
+4. `env.GIT_COMMIT` exists and equals the sidecar's `commit`;
+5. the plan file and the sidecar exist;
+6. the `<plan>.applied` marker does **not** exist (the same plan is never applied twice);
+7. the sidecar's `status` is coherent with `changes` (`2` ⇔ `true`, `0` ⇔ `false`);
+8. the sidecar's `sha256` equals the SHA-256 recomputed with `sha256sum`
+   (**fail closed**: if `sha256sum` is missing or the hash differs, nothing is applied).
+
+**Every inconsistency fails with `error` BEFORE any Terraform command.**
+
+### Commands and guards
+
+- `init -backend=true` (idempotent) and `apply -lock=true` only. **Never**
+  `-lock=false`, `-auto-approve`, `-destroy`, `-replace`, `-reconfigure` or
+  `-migrate-state`.
+- `aws-terraform-credentials` is bound with `withCredentials` only around those
+  two commands and passed **by name**: no value reaches a command line or the log.
+- **No Terraform output is echoed**; the archived evidence
+  (`terraform-apply-<env>-b<build>.txt`) only contains build, branch, commit,
+  root, plan, changes, outcome and date — no credential, no output.
+- On failure the **original exception is rethrown unchanged**; the `AccessDenied`
+  guidance (record the action and the resource; never widen the IAM policies) is
+  echoed **only when the failure really is an `AccessDenied`** — never for an
+  interruption (timeout or abort).
+
+### No changes, ordering and evidence
+
+- If the plan reported no changes: `SKIPPED_NO_CHANGES` is registered and
+  **`init`/`apply` are omitted** (no AWS call, no lock).
+- After a successful apply, in this order and **without any automatic retry**:
+  1. the `<plan>.applied` marker,
+  2. the evidence (written and archived),
+  3. `rm` of the plan and its sidecar.
+  If step 2 or 3 fails, the step reports explicitly that **the apply SUCCEEDED**
+  and that the build must not be re-run blindly — the marker, written first,
+  stops a second apply of the same plan.
+- Stage budget: `terraformApplyTimeout * 2` minutes (init + apply), while each
+  command gets `terraformApplyTimeout`.
+
+### Concurrency: builds queue
+
+`circleguardPipeline` uses **`disableConcurrentBuilds()`**; the `abortPrevious`
+option is **not** used. When a new build of the same branch starts while another
+one is running, the new build **waits in the queue** instead of aborting the
+running one. The aborting behaviour was removed because a build inside
+`terraform apply` (or waiting for a manual approval) could be killed mid-write
+and leave the `.tflock` object in S3, with a state to review.
+
+Operational implications:
+
+- A running `terraform apply` or a pending approval **always runs to completion**:
+  no newer push can cancel it.
+- Pushes **accumulate in the queue** instead of cancelling the older builds: after
+  a long stage (an approval waits up to `approvalTimeout` = 240 minutes) several
+  queued builds may run one after another. Every queued build produces its own
+  plan (its own build number), so a plan is never reused across builds.
+- Builds are **no longer cancelled automatically**: a stale queued build still
+  runs when its turn comes. If one must be discarded, stop it manually — never by
+  re-enabling `abortPrevious` without an explicit approval.
+- The `timeout` of 120 minutes applies **per build**, not to the whole queue.
+- The `.tflock` recovery runbook still applies to other interruptions (stage
+  timeout, manual abort): delete the object only after confirming that no build is
+  running.
+
+### Known limitations and follow-ups
+
+- **STAGE/PROD are disabled**: enabling them means new values for
+  `terraformApplyRoot`/`terraformApplyBranches` (PROD will also need the manual
+  `input` approval of E4).
+- `GIT_COMMIT` is **required**: without it the provenance check fails closed.
+- Plans of previous builds (`ci-<env>-b<*>.tfplan`) remain in the `dev`/`main`
+  workspaces; they can never be applied (the name carries another build number)
+  and could be cleaned up in a later phase.
+- The permissions of a real `apply` are still unvalidated: on `AccessDenied`
+  record the action and the resource and report them; never widen the IAM
+  policies from a build failure.
 
 ## Registering the library in Jenkins
 

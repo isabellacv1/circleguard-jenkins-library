@@ -2,13 +2,22 @@
  * Runs the Playwright end-to-end tests against a DEPLOYED environment.
  *
  * Jenkins has no Node.js, so the tests run inside the official Playwright image
- * through the Docker socket that the controller already mounts. The Jenkins
- * workspace is reached from the Docker daemon through the named volume
- * (`circleguard-jenkins-home` -> /var/jenkins_home), which is why the path is
- * translated before mounting it.
+ * through the Docker socket that the controller already mounts. Only the
+ * WORKSPACE of this job is mounted, with the same `volume-subpath` pattern as
+ * runInContainer (the container must never reach `credentials.xml`, `secrets/`
+ * or the workspaces of the other jobs):
  *
- * The reports (JUnit XML and the HTML report) are written back into the
- * workspace through the volume, so they can be published with the usual steps.
+ *   --mount type=volume,source=circleguard-jenkins-home,destination=/jh,\
+ *          volume-subpath=workspace/<job>
+ *
+ * Because `/jh` is now the workspace of the job, the working directory is
+ * `/jh/tests/e2e-playwright` and the reports are written back through the same
+ * mount, so they land in the workspace and can be published with the usual steps.
+ *
+ * Two guards run before the mount (same as runInContainer): the workspace must
+ * live under /var/jenkins_home/workspace (otherwise the subpath would point
+ * outside it) and it must already exist (it is created by `Checkout`, which
+ * always runs first).
  *
  * Credentials: `e2e-credential` (username/password of a test user of the app).
  *
@@ -35,8 +44,18 @@ def call(Map params = [:]) {
         error 'runE2E: no workspace available'
     }
 
-    // /var/jenkins_home/workspace/xxx  ->  /jh/workspace/xxx (inside the volume)
-    String hostWorkspace = env.WORKSPACE.replaceFirst('^/var/jenkins_home', '/jh')
+    // Only the workspace of this job is mounted: the subpath must live under
+    // /var/jenkins_home/workspace (same guard as runInContainer), otherwise the
+    // mount would reach secrets/, credentials.xml or another job's workspace.
+    String subPath = env.WORKSPACE.replaceFirst('^/var/jenkins_home/', '')
+    if (subPath == env.WORKSPACE || !subPath.startsWith('workspace/')) {
+        error "runE2E: workspace is not under /var/jenkins_home/workspace: ${env.WORKSPACE}"
+    }
+    // volume-subpath requires the directory to exist before mounting it, and it
+    // is created by the Checkout stage, which always runs first.
+    if (!fileExists(env.WORKSPACE)) {
+        error "runE2E: workspace ${env.WORKSPACE} does not exist yet (Checkout must run before this step)"
+    }
 
     echo "E2E against ${baseUrl} using ${image}"
 
@@ -53,8 +72,8 @@ def call(Map params = [:]) {
                 sh """docker run --rm \
                     --user "\$(id -u):\$(id -g)" \
                     -e HOME=/tmp \
-                    -v ${volume}:/jh \
-                    -w ${hostWorkspace}/tests/e2e-playwright \
+                    --mount 'type=volume,source=${volume},destination=/jh,volume-subpath=${subPath}' \
+                    -w /jh/tests/e2e-playwright \
                     -e BASE_URL='${baseUrl}' \
                     -e AUTH_BASE_URL='${authBaseUrl}' \
                     -e GATEWAY_BASE_URL='${gatewayBaseUrl}' \

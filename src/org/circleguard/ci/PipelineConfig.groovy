@@ -75,10 +75,24 @@ class PipelineConfig implements Serializable {
     int terraformMinFreeSpaceMB = 1500
 
     boolean trivyScan = false                // trivy config, blocks on HIGH/CRITICAL
+    // Image of the Trivy TOOL (the scanner itself), used by the IaC scan AND by
+    // the image scan. It is NOT the image being scanned: that one is built by
+    // publishImages and passed as `ref` to trivyImageScan.
     String trivyImage = 'aquasec/trivy:0.76.2'
     List<String> trivyPaths = ['infra/terraform']
     String trivySeverity = 'HIGH,CRITICAL'
     int trivyTimeout = 15
+
+    // Vulnerability scan of the BUILT images (Trivy Image): opt-in, blocking, and
+    // runs inside "Publish images" BETWEEN `docker build` and `docker push`, so a
+    // HIGH/CRITICAL finding never reaches the registry. It reads the image from
+    // the local Docker daemon through the socket and needs no credentials.
+    // Partial publication is accepted: a missing image fails at deploy time.
+    boolean trivyImageScan = false
+    String trivyImageSeverity = 'HIGH,CRITICAL'        // configured apart from the IaC scan
+    List<String> trivyImageBranches = ['dev', 'main']  // ⊆ publishBranches; PRs never publish
+    int trivyImageTimeout = 15
+    String trivyImageIgnoreFile = '.trivyignore.yaml'  // same file as the IaC scan
 
     // Terraform plan against the REAL S3 backend (plan only: no apply, no
     // artifact). Off by default because it needs AWS credentials and contacts
@@ -93,6 +107,16 @@ class PipelineConfig implements Serializable {
     String terraformAwsCredentialsId = 'aws-terraform-credentials'
     String terraformAwsRegion = 'us-east-1'
     int terraformPlanTimeout = 20            // stage budget AND per-command timeout
+
+    // Terraform apply (DEV only in this phase: STAGE/PROD stay disabled).
+    // Off by default and gated by flag AND branch, so PRs never receive the AWS
+    // credential. The stage budget is 2x the command timeout (init + apply).
+    boolean terraformApply = false
+    // Single root on purpose, like terraformPlanRoot: it must not follow the
+    // other lists, so enabling stage/prod is always an explicit decision.
+    String terraformApplyRoot = 'infra/terraform/envs/dev'
+    List<String> terraformApplyBranches = ['dev']
+    int terraformApplyTimeout = 30
 
     int buildTimeout = 30
     int testTimeout = 45
@@ -146,12 +170,21 @@ class PipelineConfig implements Serializable {
         this.trivyPaths = c.trivyPaths ?: this.trivyPaths
         this.trivySeverity = c.trivySeverity ?: this.trivySeverity
         this.trivyTimeout = c.trivyTimeout ? c.trivyTimeout as int : this.trivyTimeout
+        this.trivyImageScan = c.trivyImageScan != null ? c.trivyImageScan as boolean : this.trivyImageScan
+        this.trivyImageSeverity = c.trivyImageSeverity ?: this.trivyImageSeverity
+        this.trivyImageBranches = c.trivyImageBranches ?: this.trivyImageBranches
+        this.trivyImageTimeout = c.trivyImageTimeout ? c.trivyImageTimeout as int : this.trivyImageTimeout
+        this.trivyImageIgnoreFile = c.trivyImageIgnoreFile ?: this.trivyImageIgnoreFile
         this.terraformPlan = c.terraformPlan != null ? c.terraformPlan as boolean : this.terraformPlan
         this.terraformPlanRoot = c.terraformPlanRoot ?: this.terraformPlanRoot
         this.terraformPlanBranches = c.terraformPlanBranches ?: this.terraformPlanBranches
         this.terraformAwsCredentialsId = c.terraformAwsCredentialsId ?: this.terraformAwsCredentialsId
         this.terraformAwsRegion = c.terraformAwsRegion ?: this.terraformAwsRegion
         this.terraformPlanTimeout = c.terraformPlanTimeout ? c.terraformPlanTimeout as int : this.terraformPlanTimeout
+        this.terraformApply = c.terraformApply != null ? c.terraformApply as boolean : this.terraformApply
+        this.terraformApplyRoot = c.terraformApplyRoot ?: this.terraformApplyRoot
+        this.terraformApplyBranches = c.terraformApplyBranches ?: this.terraformApplyBranches
+        this.terraformApplyTimeout = c.terraformApplyTimeout ? c.terraformApplyTimeout as int : this.terraformApplyTimeout
         this.buildTimeout = c.buildTimeout ? c.buildTimeout as int : this.buildTimeout
         this.testTimeout = c.testTimeout ? c.testTimeout as int : this.testTimeout
         this.integrationTimeout = c.integrationTimeout ? c.integrationTimeout as int : this.integrationTimeout

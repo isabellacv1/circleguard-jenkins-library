@@ -29,7 +29,8 @@
  * environment: it must be confirmed with a real `docker run` before considering
  * it validated. Fallback if the mount fails: mount the whole volume with
  * `-v circleguard-jenkins-home:/jh` and translate `/var/jenkins_home/...` to
- * `/jh/...` (the behaviour used until Fase 1.1 and still used by runE2E).
+ * `/jh/...` (the behaviour used until Fase 1.1; since the runE2E change no step
+ * mounts the whole volume anymore, so this is only an emergency fallback).
  *
  * The container runs with the uid/gid of the workspace owner and HOME=/tmp, so
  * the files it writes (reports, .terraform/, ...) are not root-owned and the

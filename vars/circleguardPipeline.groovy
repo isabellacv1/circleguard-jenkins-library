@@ -22,9 +22,9 @@ def call(Map rawConfig = [:]) {
         options {
             skipDefaultCheckout()
             timestamps()
-            timeout(time: 90, unit: 'MINUTES')
+            timeout(time: 120, unit: 'MINUTES')
             buildDiscarder(logRotator(numToKeepStr: "${cfg.buildsToKeep}", artifactNumToKeepStr: '10'))
-            disableConcurrentBuilds(abortPrevious: true)
+            disableConcurrentBuilds()
         }
 
         environment {
@@ -124,8 +124,8 @@ def call(Map rawConfig = [:]) {
                 }
             }
 
-            // Terraform plan against the real S3 backend (plan only: this phase
-            // never runs `apply`, and the saved plan is not archived).
+            // Terraform plan against the real S3 backend: the saved plan is not
+            // archived and is applied by the next stage, in the SAME build.
             // DEV only: the flag AND the branch are both required, so PRs and
             // any other branch never receive the AWS credential.
             stage('Terraform plan') {
@@ -137,13 +137,44 @@ def call(Map rawConfig = [:]) {
                 }
                 steps {
                     script {
-                        terraformPlan(
+                        Map plan = terraformPlan(
                             image: cfg.terraformImage,
                             root: cfg.terraformPlanRoot,
                             credentialsId: cfg.terraformAwsCredentialsId,
                             region: cfg.terraformAwsRegion,
                             minFreeSpaceMB: cfg.terraformMinFreeSpaceMB,
                             timeout: cfg.terraformPlanTimeout
+                        )
+                        // Persisted so the apply stage can prove that the plan it
+                        // consumes was produced by THIS build and this revision.
+                        env.TF_PLAN_BUILD = env.BUILD_NUMBER
+                        env.TF_PLAN_ROOT = plan.root
+                        env.TF_PLAN_FILE = plan.planFile
+                        env.TF_PLAN_INFO = plan.planInfo
+                        env.TF_PLAN_CHANGES = plan.changes.toString()
+                    }
+                }
+            }
+
+            // Applies the plan produced by the previous stage in the SAME build.
+            // DEV only (flag AND branch): PRs never receive the AWS credential.
+            // The stage budget is 2x the command timeout (init + apply).
+            stage('Terraform apply') {
+                when {
+                    expression { cfg.terraformApply && cfg.terraformApplyBranches.contains(env.BRANCH_NAME) }
+                }
+                options {
+                    timeout(time: cfg.terraformApplyTimeout * 2, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        terraformApply(
+                            image: cfg.terraformImage,
+                            root: cfg.terraformApplyRoot,
+                            credentialsId: cfg.terraformAwsCredentialsId,
+                            region: cfg.terraformAwsRegion,
+                            minFreeSpaceMB: cfg.terraformMinFreeSpaceMB,
+                            timeout: cfg.terraformApplyTimeout
                         )
                     }
                 }
@@ -168,7 +199,14 @@ def call(Map rawConfig = [:]) {
                             registry: cfg.registry,
                             credentialsId: cfg.registryCredentialsId,
                             version: version,
-                            images: cfg.images
+                            images: cfg.images,
+                            // Trivy Image (opt-in): scan between build and push
+                            scanVulnerabilities: cfg.trivyImageScan,
+                            trivyToolImage: cfg.trivyImage,
+                            scanSeverity: cfg.trivyImageSeverity,
+                            scanTimeout: cfg.trivyImageTimeout,
+                            scanBranches: cfg.trivyImageBranches,
+                            scanIgnoreFile: cfg.trivyImageIgnoreFile
                         )
                     }
                 }

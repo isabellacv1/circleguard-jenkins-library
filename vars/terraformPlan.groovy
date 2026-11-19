@@ -9,7 +9,9 @@
  *   2. rm of the plan of a previous build (a stale plan must never survive)
  *   3. terraform init  -backend=true -no-color -input=false   (real S3 backend)
  *   4. terraform plan  -no-color -input=false -lock=true -detailed-exitcode
- *                      -out=<root>/ci-<env>.tfplan
+ *                      -out=<root>/ci-<env>-b<build>.tfplan
+ *   5. sidecar <plan>.info with build, commit, root, changes, status, sha256
+ *      and date (sha256sum is required: without it the step fails closed)
  *
  * Backend (S3): `init` contacts the bucket declared in `<root>/versions.tf`,
  * reads the state and creates the `.tflock` (`use_lockfile = true`). It never
@@ -42,9 +44,11 @@
  * duplicated.
  *
  * Evidence: the plan file stays in the workspace of the build
- * (`<root>/ci-<env>.tfplan`, extension ignored by `.gitignore`) and is NEVER
- * archived: it must not be downloadable, only reviewable in the workspace of
- * the same build (a later apply phase will consume it from there).
+ * (`<root>/ci-<env>-b<build>.tfplan`, extension ignored by `.gitignore`) and is
+ * NEVER archived: it must not be downloadable, only reviewable in the workspace
+ * of the same build. The `<plan>.info` sidecar carries its provenance (build,
+ * commit, root, changes, status, date) so `terraformApply` can prove that the
+ * plan belongs to this build and this revision before applying it.
  *
  * Usage:
  *   terraformPlan(root: 'infra/terraform/envs/dev',
@@ -52,7 +56,8 @@
  *                 image: 'hashicorp/terraform:1.17.2',
  *                 region: 'us-east-1')
  *
- * Returns [root: ..., planFile: ..., changes: true|false, status: 0|2].
+ * Returns [root: ..., planFile: ..., planInfo: ..., changes: true|false,
+ * status: 0|2].
  * Raises `error` when the plan fails or the plan file was not written.
  */
 def call(Map params = [:]) {
@@ -99,16 +104,21 @@ def call(Map params = [:]) {
               "the backend of ${root} cannot be initialised"
     }
 
-    // Default plan name: ci-<last segment of the root>.tfplan (e.g.
-    // infra/terraform/envs/dev -> ci-dev.tfplan), always inside the root and
-    // always with the extension ignored by .gitignore (`*.tfplan`).
+    // Default plan name: ci-<env>-b<build>.tfplan (e.g. infra/terraform/envs/dev
+    // in build 47 -> ci-dev-b47.tfplan), always inside the root and always with
+    // the extension ignored by .gitignore (`*.tfplan`). The build number is part
+    // of the name on purpose: the apply step of another build cannot consume it.
+    String build = env.BUILD_NUMBER ?: 'nobuild'
     if (!planName) {
-        planName = "ci-${root.tokenize('/').last()}.tfplan"
+        planName = "ci-${root.tokenize('/').last()}-b${build}.tfplan"
     }
     if (!(planName ==~ /[A-Za-z0-9._-]+/) || !planName.endsWith('.tfplan')) {
         error "terraformPlan: planFile must be a plain name ending in .tfplan: ${planName}"
     }
     String planPath = "${root}/${planName}"
+    // Sidecar with the provenance of the plan (build, commit, root, changes,
+    // status, date): terraformApply validates it before running anything.
+    String infoPath = "${planPath}.info"
 
     // 0) Free space BEFORE any Terraform command and before the credentials are
     //    bound: `init` downloads ~772 MB of providers on the first build.
@@ -130,9 +140,9 @@ def call(Map params = [:]) {
     sh "mkdir -p \"${env.WORKSPACE}/${pluginCacheName}\""
     String pluginCache = "/ws/${pluginCacheName}"
 
-    // 2) The plan of a previous build is removed: an apply can only ever use a
-    //    plan produced by THIS build.
-    sh "rm -f \"${planPath}\""
+    // 2) The plan of a previous build is removed (and its sidecar): an apply can
+    //    only ever use a plan produced by THIS build.
+    sh "rm -f \"${planPath}\" \"${infoPath}\""
 
     echo "terraform plan of ${root} with ${image}"
 
@@ -189,8 +199,41 @@ def call(Map params = [:]) {
         error "terraformPlan: Terraform did not write the plan file ${planPath}"
     }
 
+    // 5.5) SHA-256 of the plan: terraformApply recomputes it and refuses a plan
+    //      whose content changed after this point. Fail CLOSED when sha256sum is
+    //      not available: without it the provenance of the file cannot be proven,
+    //      so no sidecar (and no plan) is left behind.
+    String planHash = ''
+    try {
+        String output = sh(script: "sha256sum \"${planPath}\"", returnStdout: true)
+        planHash = output.trim().split(/\s+/)[0] ?: ''
+    } catch (Exception e) {
+        error "terraformPlan: unable to compute the SHA-256 of ${planPath} " +
+              "(${e.message}): sha256sum is required to prove the provenance of " +
+              'the plan, aborting before the sidecar is written.'
+    }
+    if (!(planHash ==~ /[0-9a-f]{64}/)) {
+        error "terraformPlan: unexpected SHA-256 for ${planPath}: '${planHash}'"
+    }
+
+    // 6) Sidecar with the provenance of THIS plan (build, commit, root, changes,
+    //    status, sha256, date): terraformApply validates every one of them before
+    //    running any command. Written only after a successful plan.
+    //    java.time instead of Date.format(String, TimeZone): available in every
+    //    Groovy version (the DGM overload is not) and always UTC.
+    String createdAt = java.time.Instant.now().toString()
+    writeFile file: infoPath,
+              text: "build=${build}\n" +
+                    "commit=${env.GIT_COMMIT ?: 'unknown'}\n" +
+                    "root=${root}\n" +
+                    "changes=${status == 2}\n" +
+                    "status=${status}\n" +
+                    "sha256=${planHash}\n" +
+                    "createdAt=${createdAt}\n"
+
     return [root    : root,
             planFile: planPath,
+            planInfo: infoPath,
             changes : status == 2,
             status  : status]
 }
