@@ -69,7 +69,7 @@ circleguardPipeline(
 | `promote` | `false` | Enables the promotion stages `dev -> stage -> prod`. |
 | `stageApproval` | `false` | `false` promotes to stage automatically after the E2E tests. |
 | `prodApproval` | `true` | `true` waits for a manual approval (`input`) before promoting to prod. |
-| `approvalTimeout` | `240` | Minutes the approver has to answer the `input`. |
+| `approvalTimeout` | `240` | Minutes the approver has to answer the `input`. **The global build timeout (120 min) caps the effective wait**: the promotion never gets the full 240 minutes (see *Concurrency: builds queue*). |
 | `promotionRecordFile` | `promotion-record.txt` | Artifact with the evidence of every promotion. |
 | `terraformValidate` | `false` | Runs `terraform fmt -check`, `terraform init -backend=false` and `terraform validate` on every root. No AWS credentials, no `plan`/`apply`. |
 | `terraformImage` | `hashicorp/terraform:1.17.2` | Pinned Terraform image. Must be `>= 1.10`: the backends declare `use_lockfile`. |
@@ -101,8 +101,8 @@ circleguardPipeline(
 | `terraformApprovalTimeout` | `30` | Minutes the approver has to answer (must be `> 0`, otherwise the configuration is rejected). |
 | `terraformApprovalSubmitter` | `admin` | Users/groups allowed to approve (passed to `submitter` of `input`). Must not be empty, otherwise the configuration is rejected. |
 | `terraformApprovalMaxAgeMinutes` | `60` | A plan older than this is rejected instead of applied (must be `> 0`). |
-| `terraformApplyProdRoot` | `infra/terraform/envs/prod` | PROD root (declared, **inert**: no stage consumes it yet). |
-| `terraformApplyProdBranches` | `['main']` | Branch for the PROD target (declared, **inert**). |
+| `terraformApplyProdRoot` | `infra/terraform/envs/prod` | PROD root used by the three PROD stages; inert until `terraformApplyProd` (and, for the approval, `terraformApproval`) is enabled. |
+| `terraformApplyProdBranches` | `['main']` | Branch for the PROD target: PROD is only ever selected from `main` (any other branch, or a branch shared with DEV, fails the build). |
 | `terraformApplyProd` | `false` | PROD apply switch: **off**. Independent from `terraformApprovalProd`. |
 | `terraformApprovalProd` | `false` | PROD approval switch: **off**. Both PROD switches must be enabled explicitly. |
 
@@ -117,14 +117,15 @@ circleguardPipeline(
 | SonarQube | analysis + quality gate (if `sonar`) |
 | Terraform validate | `fmt -check`, `init -backend=false` and `validate` of every Terraform root (if `terraformValidate`) |
 | Trivy IaC | `trivy config` of `trivyPaths`; HIGH/CRITICAL findings fail the build and the report is archived (if `trivyScan`) |
-| Terraform plan | `terraform init -backend=true` + `terraform plan -detailed-exitcode -out=<root>/ci-<env>-b<build>.tfplan` against the real S3 backend, with `aws-terraform-credentials` injected **by name** (if `terraformPlan` and branch in `terraformPlanBranches`) |
-| Terraform apply | `terraform init -backend=true` + `terraform apply -lock=true ci-<env>-b<build>.tfplan`, the plan of **this** build only (if `terraformApply` and branch in `terraformApplyBranches`) |
-| Terraform plan PROD | same plan step for the PROD root, resolved from the branch (`main` only, and only when `terraformApplyProd` **and** `terraformPlan` are on) |
-| Terraform approval | manual `input` between the PROD plan and the PROD apply (if `terraformApproval` **and** `terraformApprovalProd`, the plan has changes and the build still has a full approval window) |
-| Terraform apply PROD | `terraform apply -lock=true` for the PROD root, only with a valid approval of **this** build (`requireApproval: true`) |
+| Terraform plan DEV | `terraform init -backend=true` + `terraform plan -detailed-exitcode -out=<root>/ci-<env>-b<build>.tfplan` against the real S3 backend, with `aws-terraform-credentials` injected **by name** (stage `Terraform plan`, if `terraformPlan` and branch in `terraformPlanBranches`) |
+| Terraform plan PROD | same plan step for the PROD root, resolved from the branch (`main` only, and only when `terraformApplyProd` **and** `terraformPlan` are on; stage `Terraform plan PROD`) |
+| Terraform approval PROD | manual `input` between the PROD plan and the PROD apply (stage `Terraform approval`; requires `terraformApplyProd` **and** `terraformApproval` **and** `terraformApprovalProd`, a plan with changes and a full approval window) |
+| Terraform apply DEV | `terraform init -backend=true` + `terraform apply -lock=true ci-<env>-b<build>.tfplan`, the plan of **this** build only, **never an approval** (stage `Terraform apply`, if `terraformApply` and branch in `terraformApplyBranches`) |
+| Terraform apply PROD | `terraform apply -lock=true` for the PROD root, only with a valid approval of **this** build (`requireApproval: true`; stage `Terraform apply PROD`) |
 | Publish images | `docker build` + `docker push` of every image (if `publish` and branch in `publishBranches`); each image is scanned with Trivy **between the build and the push** when `trivyImageScan` is enabled |
 | Deploy | Copies the compose files to the target host over SSH and runs `docker compose up -d --wait` with the published images (if `deploy` and branch in `deployBranches`) |
 | Verify deployment | HTTP check of every component with retries; the build fails if a service does not answer (if `deploy`) |
+| Smoke tests | Functional HTTP checks against the target host, with a JUnit report (if `deploy` and `smokeTests`) |
 | E2E tests | Playwright tests in a container against the deployed `dev` (condition to promote, if `e2e`) |
 | Promote to stage | Deploys the **same version** to `stage` and verifies it; manual `input` only if `stageApproval` |
 | Promote to prod | Deploys the **same version** to `prod`, verifies it and archives `promotion-record.txt`; always behind a manual `input` |
@@ -443,8 +444,10 @@ circleguardPipeline(
 ## Terraform apply
 
 Optional stage (`terraformApply: false` by default) that applies **the plan
-produced by the `Terraform plan` stage of the SAME build**. STAGE and PROD are
-**not enabled** in this phase.
+produced by the `Terraform plan` stage of the SAME build**. STAGE has no
+parameters at all; the PROD stages are **implemented and wired but disabled by
+default** (`terraformApplyProd`, `terraformApproval` and `terraformApprovalProd`
+are all `false`), so only DEV runs unless those switches are enabled together.
 
 ```groovy
 circleguardPipeline(
@@ -525,10 +528,11 @@ branch and a root can never be combined arbitrarily:
 - Stages: `Terraform plan PROD` → `Terraform approval` → `Terraform apply PROD`,
   between the DEV plan and `Publish images`.
 - **Gates (all required):** plan `terraformApplyProd` **and** `terraformPlan` +
-  PROD target · approval `terraformApproval` **and** `terraformApprovalProd` +
-  PROD target + plan with changes · apply `terraformApplyProd` + PROD target +
-  plan with changes **and** `TF_APPROVED_TARGET == 'prod'` (otherwise it refuses
-  explicitly, before any credential). The apply step receives `requireApproval: true` and
+  PROD target · approval `terraformApplyProd` **and** `terraformApproval`
+  **and** `terraformApprovalProd` + PROD target + plan with changes · apply
+  `terraformApplyProd` + PROD target + plan with changes **and**
+  `TF_APPROVED_TARGET == 'prod'` (otherwise it refuses explicitly, before any
+  credential). The apply step receives `requireApproval: true` and
   `maxAgeMinutes: terraformApprovalMaxAgeMinutes` and re-validates build, commit,
   root, both hashes and both ages (S3/S4).
 - **All PROD switches are OFF by default** (`terraformApplyProd`,
@@ -565,26 +569,38 @@ Operational implications:
   runs when its turn comes. If one must be discarded, stop it manually — never by
   re-enabling `abortPrevious` without an explicit approval.
 - The `timeout` of 120 minutes applies **per build**, not to the whole queue.
+- The same limit caps the **image promotion**: `approvalTimeout` (240 min) is the
+  maximum the approver is allowed to take, but the build stops 120 minutes after
+  it started, so the effective waiting time for `Promote to prod` is
+  `120 min − elapsed`. The Terraform approval (`terraformApprovalTimeout`, 30 min)
+  fits inside that budget and is additionally guarded by `requireApprovalTimeLeft()`.
 - The `.tflock` recovery runbook still applies to other interruptions (stage
   timeout, manual abort): delete the object only after confirming that no build is
   running.
 
 ### Known limitations and follow-ups
 
-- **STAGE/PROD are disabled**: STAGE has no parameters at all, and PROD is
-  declared in **S1 but inert**: `terraformApplyProdRoot`,
-  `terraformApplyProdBranches`, `terraformApplyProd` and `terraformApprovalProd`
-  exist with safe defaults (**both switches off**) and **no stage consumes them
-  yet**. Enabling them requires the approval step of E4 (S2+) and an explicit
-  `input` approval.
-- **Approval step exists but is not wired yet (S3)**: `terraformApproval` (off),
-  `terraformApprovalTimeout` (30), `terraformApprovalSubmitter` (`admin`) and
-  `terraformApprovalMaxAgeMinutes` (60) are validated when the pipeline is built
-  — timeout and max age must be `> 0`, the submitter must not be empty — and the
-  standalone step `vars/terraformApproval.groovy` now validates the plan (build,
-  commit, root, both hashes and its age) before asking for the `input` and
-  persisting `TF_APPROVED_*`. It is **not called by any stage yet** (S5), so
-  changing these settings still has no effect on the pipeline.
+- **STAGE has no parameters at all; PROD is implemented and wired but disabled
+  by default**: `terraformApplyProdRoot`, `terraformApplyProdBranches`,
+  `terraformApplyProd`, `terraformApproval` and `terraformApprovalProd` exist
+  with safe defaults (**every switch off**) and the three PROD stages
+  (`Terraform plan PROD`, `Terraform approval`, `Terraform apply PROD`) are
+  gated by them, so **no PROD stage is selected on any branch** with the
+  defaults. STAGE would still need new parameters.
+- **The approval step is wired**: `terraformApproval` is invoked by the
+  `Terraform approval` stage, between the PROD plan and the PROD apply, and its
+  configuration (`terraformApprovalTimeout = 30`,
+  `terraformApprovalSubmitter = 'admin'`, `terraformApprovalMaxAgeMinutes = 60`)
+  is validated when the pipeline is built — timeout and max age must be `> 0`
+  and the submitter must not be empty. Those settings have no effect while the
+  PROD switches stay off.
+- **What the approval step checks**: `vars/terraformApproval.groovy` validates the
+  plan (build, commit, root, both hashes and its age, including
+  `createdAt <= approvedAt`) **before** asking for the `input`, and only then
+  persists `TF_APPROVED_BY`, `TF_APPROVED_AT`, `TF_APPROVED_PLAN_SHA` and
+  `TF_APPROVED_BUILD`; `terraformApply` re-validates all of it **before binding
+  any credential**. Those settings have no effect while the PROD switches stay
+  off.
 - `GIT_COMMIT` is **required**: without it the provenance check fails closed.
 - Plans of previous builds (`ci-<env>-b<*>.tfplan`) remain in the `dev`/`main`
   workspaces; they can never be applied (the name carries another build number)
