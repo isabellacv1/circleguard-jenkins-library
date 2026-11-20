@@ -106,6 +106,14 @@ circleguardPipeline(
 | `terraformApplyProd` | `false` | PROD apply switch: **off**. Independent from `terraformApprovalProd`. |
 | `terraformApprovalProd` | `false` | PROD approval switch: **off**. Both PROD switches must be enabled explicitly. |
 
+**Application secrets.** The deploy and promotion stages also need the Jenkins
+**Secret file** credential `<environment>-app-secrets` (`dev-app-secrets`,
+`stage-app-secrets`, `prod-app-secrets`): a `KEY=VALUE` file following
+`deploy/secrets/secrets.env.example` of the application. `deployEnvironment`
+appends it to the `.env` copied to the host (`600`), without printing it; its
+`secretsCredentialId` parameter overrides the id. It is mandatory: the compose
+files reject a missing secret, so a deploy without the credential fails.
+
 ### Stages
 
 | Stage | What it does |
