@@ -5,6 +5,8 @@ package org.circleguard.ci
  * Every value has a default, so the Jenkinsfile only sets what changes.
  */
 class PipelineConfig implements Serializable {
+    static final String K8S_MANIFEST_NAMESPACE = 'circleguard'
+
     boolean integrationTests = true
     boolean sonar = false
     String sonarServer = 'CircleGuard-SonarQube'
@@ -18,29 +20,50 @@ class PipelineConfig implements Serializable {
         [name: 'circleguard/auth-service',      dockerfile: 'services/circleguard-auth-service/Dockerfile',      context: '.'],
         [name: 'circleguard/identity-service',  dockerfile: 'services/circleguard-identity-service/Dockerfile',  context: '.'],
         [name: 'circleguard/promotion-service', dockerfile: 'services/circleguard-promotion-service/Dockerfile', context: '.'],
+        [name: 'circleguard/notification-service', dockerfile: 'services/circleguard-notification-service/Dockerfile', context: '.'],
         [name: 'circleguard/form-service',      dockerfile: 'services/circleguard-form-service/Dockerfile',      context: '.'],
         [name: 'circleguard/gateway-service',   dockerfile: 'services/circleguard-gateway-service/Dockerfile',   context: '.'],
+        [name: 'circleguard/dashboard-service', dockerfile: 'services/circleguard-dashboard-service/Dockerfile', context: '.'],
+        [name: 'circleguard/file-service',      dockerfile: 'services/circleguard-file-service/Dockerfile',      context: '.'],
         [name: 'circleguard/web',               dockerfile: 'mobile/Dockerfile',                                 context: 'mobile'],
     ]
 
-    // Deployment to AWS (HU-13). The environment files live in deploy/environments/.
+    // Kubernetes deployment replaces the former SSH/Compose path.
     boolean deploy = false
     String environment = 'dev'
     List<String> deployBranches = ['dev']
-    String deployCredentialId = null     // defaults to "${environment}-credential"
+    String kubeconfigCredentialId = null
+    String k8sContext = ''
+    String k8sNamespace = 'circleguard'
+    Map<String, String> k8sContexts = [:]
+    Map<String, String> k8sNamespaces = [:]
+    String k8sRegistry = '10.20.1.230:8082'
+    Map<String, String> k8sOverlayPaths = [:]
+    Map<String, String> k8sIngressUrls = [:]
+    List<String> k8sDeployments = [
+        'circleguard-web',
+        'circleguard-auth-service',
+        'circleguard-identity-service',
+        'circleguard-promotion-service',
+        'circleguard-notification-service',
+        'circleguard-form-service',
+        'circleguard-gateway-service',
+        'circleguard-dashboard-service',
+        'circleguard-file-service',
+    ]
+    List<Map> k8sVerifyPaths = [
+        [name: 'web home',               path: '/',                                                                  expected: '200'],
+        [name: 'web runtime config',     path: '/env-config.js',                                                     expected: '200'],
+        [name: 'gateway validates token', method: 'POST', path: '/api/v1/gate/validate', body: '{"token":"invalid"}', expected: '200'],
+        [name: 'form pending surveys',   path: '/api/v1/certificates/pending',                                       expected: '200'],
+        [name: 'promotion health stats', path: '/api/v1/health-status/stats',                                        expected: '200'],
+        [name: 'identity requires auth', path: '/api/v1/identities/lookup/00000000-0000-0000-0000-000000000000',     expected: '401 403'],
+    ]
     int deployTimeout = 20
     int verifyTimeout = 15
-    int healthRetries = 20
-    int healthIntervalSeconds = 10
-    // Components of "Parte 1" and how to check that they are available.
-    List<Map> services = [
-        [name: 'gateway',   port: 8087],
-        [name: 'auth',      port: 8180],
-        [name: 'identity',  port: 8083],
-        [name: 'form',      port: 8086],
-        [name: 'promotion', port: 8088],
-        [name: 'web',       port: 8081, path: '/'],
-    ]
+    int verifyRetries = 20
+    int verifyIntervalSeconds = 10
+    int k8sRolloutTimeout = 300
 
     // Frees Docker disk space on the Jenkins host after every build.
     boolean dockerCleanup = true
@@ -156,12 +179,21 @@ class PipelineConfig implements Serializable {
         this.deploy = c.deploy != null ? c.deploy as boolean : this.deploy
         this.environment = c.environment ?: this.environment
         this.deployBranches = c.deployBranches ?: this.deployBranches
-        this.deployCredentialId = c.deployCredentialId ?: this.deployCredentialId
+        this.kubeconfigCredentialId = c.kubeconfigCredentialId ?: (c.containsKey('kubeconfigCredentialId') ? c.kubeconfigCredentialId : null)
+        this.k8sContext = c.k8sContext ?: this.k8sContext
+        this.k8sNamespace = c.k8sNamespace ?: this.k8sNamespace
+        this.k8sContexts = c.k8sContexts ?: this.k8sContexts
+        this.k8sNamespaces = c.k8sNamespaces ?: this.k8sNamespaces
+        this.k8sRegistry = c.k8sRegistry ?: this.k8sRegistry
+        this.k8sOverlayPaths = c.k8sOverlayPaths ?: this.k8sOverlayPaths
+        this.k8sIngressUrls = c.k8sIngressUrls ?: this.k8sIngressUrls
+        this.k8sDeployments = c.k8sDeployments ?: this.k8sDeployments
+        this.k8sVerifyPaths = c.k8sVerifyPaths ?: this.k8sVerifyPaths
         this.deployTimeout = c.deployTimeout ? c.deployTimeout as int : this.deployTimeout
         this.verifyTimeout = c.verifyTimeout ? c.verifyTimeout as int : this.verifyTimeout
-        this.healthRetries = c.healthRetries ? c.healthRetries as int : this.healthRetries
-        this.healthIntervalSeconds = c.healthIntervalSeconds ? c.healthIntervalSeconds as int : this.healthIntervalSeconds
-        this.services = c.services ?: this.services
+        this.verifyRetries = c.verifyRetries ? c.verifyRetries as int : this.verifyRetries
+        this.verifyIntervalSeconds = c.verifyIntervalSeconds ? c.verifyIntervalSeconds as int : this.verifyIntervalSeconds
+        this.k8sRolloutTimeout = c.k8sRolloutTimeout ? c.k8sRolloutTimeout as int : this.k8sRolloutTimeout
         this.dockerCleanup = c.dockerCleanup != null ? c.dockerCleanup as boolean : this.dockerCleanup
         this.smokeTests = c.smokeTests != null ? c.smokeTests as boolean : this.smokeTests
         this.smokeCredentialsId = c.containsKey('smokeCredentialsId') ? c.smokeCredentialsId : this.smokeCredentialsId
@@ -219,6 +251,54 @@ class PipelineConfig implements Serializable {
         this.buildsToKeep = c.buildsToKeep ? c.buildsToKeep as int : this.buildsToKeep
         this.discordCredentialsId = c.discordCredentialsId != null ? c.discordCredentialsId : this.discordCredentialsId
 
+        if (this.deploy) {
+            if (!this.k8sRegistry?.trim()) {
+                throw new IllegalArgumentException('PipelineConfig: k8sRegistry must not be empty')
+            }
+            if (this.images.size() != 9) {
+                throw new IllegalArgumentException('PipelineConfig: images must declare the nine application images')
+            }
+            if (this.k8sDeployments.size() != 9) {
+                throw new IllegalArgumentException('PipelineConfig: k8sDeployments must name the nine application Deployments')
+            }
+            if (this.k8sVerifyPaths.isEmpty()) {
+                throw new IllegalArgumentException('PipelineConfig: k8sVerifyPaths must not be empty')
+            }
+
+            List<String> k8sEnvironments = [this.environment]
+            if (this.promote) {
+                k8sEnvironments << 'stage' << 'prod'
+            }
+            this.k8sNamespaces.each { String envName, Object configured ->
+                if (configured?.toString()?.trim() && configured.toString().trim() != K8S_MANIFEST_NAMESPACE) {
+                    throw new IllegalArgumentException(
+                            "PipelineConfig: manifests hardcode namespace '${K8S_MANIFEST_NAMESPACE}'; " +
+                            "k8sNamespaces['${envName}'] cannot select another namespace")
+                }
+            }
+            k8sEnvironments.unique().each { String environmentName ->
+                if (!contextFor(environmentName)) {
+                    throw new IllegalArgumentException(
+                            "PipelineConfig: k8sContext is required when deploy=true (environment=${environmentName})")
+                }
+                String configuredNamespace = namespaceFor(environmentName)
+                if (!configuredNamespace) {
+                    throw new IllegalArgumentException(
+                            "PipelineConfig: k8sNamespace is required for environment=${environmentName}")
+                }
+                if (configuredNamespace != K8S_MANIFEST_NAMESPACE) {
+                    throw new IllegalArgumentException(
+                            "PipelineConfig: manifests hardcode namespace '${K8S_MANIFEST_NAMESPACE}'; " +
+                            "namespace '${configuredNamespace}' is invalid for environment=${environmentName}")
+                }
+                String ingress = this.k8sIngressUrls[environmentName]
+                if (!ingress?.trim()) {
+                    throw new IllegalArgumentException(
+                            "PipelineConfig: k8sIngressUrls['${environmentName}'] is required when deploy=true")
+                }
+            }
+        }
+
         // Fail fast on an invalid approval configuration: a timeout or an age of
         // 0 minutes, or an empty submitter, would make the approval impossible to
         // grant (or meaningless). Better to refuse the configuration than to run
@@ -238,5 +318,15 @@ class PipelineConfig implements Serializable {
             throw new IllegalArgumentException(
                     'PipelineConfig: terraformApprovalSubmitter must not be empty')
         }
+    }
+
+    String contextFor(String environmentName) {
+        String configured = this.k8sContexts[environmentName] ?: this.k8sContext
+        return configured?.trim() ?: ''
+    }
+
+    String namespaceFor(String environmentName) {
+        String configured = this.k8sNamespaces[environmentName] ?: this.k8sNamespace
+        return configured?.trim() ?: ''
     }
 }

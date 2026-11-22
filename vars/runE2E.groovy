@@ -23,9 +23,9 @@
  *
  * Usage:
  *   runE2E(
- *       baseUrl: 'http://44.212.47.173:8081',
- *       authBaseUrl: 'http://44.212.47.173:8180',
- *       gatewayBaseUrl: 'http://44.212.47.173:8087'
+ *       baseUrl: 'http://circleguard.example.com',
+ *       authBaseUrl: 'http://circleguard.example.com',
+ *       gatewayBaseUrl: 'http://circleguard.example.com'
  *   )
  */
 def call(Map params = [:]) {
@@ -59,9 +59,20 @@ def call(Map params = [:]) {
 
     echo "E2E against ${baseUrl} using ${image}"
 
+    String resultsFile = 'tests/e2e-playwright/results.xml'
+    String reportDir = 'tests/e2e-playwright/playwright-report'
+    String resultsDir = 'tests/e2e-playwright/test-results'
+    Throwable originalFailure = null
+
+    try {
+        sh "rm -f ${q(resultsFile)} && rm -rf ${q(reportDir)} ${q(resultsDir)}"
+    } catch (Throwable cleanupFailure) {
+        throw new RuntimeException("runE2E: could not clean previous E2E evidence: ${cleanupFailure.message}", cleanupFailure)
+    }
+
     // The reports are published even when the tests fail (sh throws on a non-zero exit),
     // so the failure can be analysed from the build: JUnit, HTML report, screenshots,
-    // videos and traces.
+    // videos and traces. A failure while publishing must never hide the original one.
     try {
         withCredentials([usernamePassword(credentialsId: credentialsId,
                                           usernameVariable: 'E2E_USERNAME',
@@ -74,9 +85,9 @@ def call(Map params = [:]) {
                     -e HOME=/tmp \
                     --mount 'type=volume,source=${volume},destination=/jh,volume-subpath=${subPath}' \
                     -w /jh/tests/e2e-playwright \
-                    -e BASE_URL='${baseUrl}' \
-                    -e AUTH_BASE_URL='${authBaseUrl}' \
-                    -e GATEWAY_BASE_URL='${gatewayBaseUrl}' \
+                    -e BASE_URL=${q(baseUrl)} \
+                    -e AUTH_BASE_URL=${q(authBaseUrl)} \
+                    -e GATEWAY_BASE_URL=${q(gatewayBaseUrl)} \
                     -e E2E_USERNAME \
                     -e E2E_PASSWORD \
                     -e CI=true \
@@ -84,9 +95,36 @@ def call(Map params = [:]) {
                     bash -c 'npm ci && npx playwright test'"""
             }
         }
-    } finally {
-        junit testResults: 'tests/e2e-playwright/results.xml', allowEmptyResults: true
+    } catch (Throwable t) {
+        originalFailure = t
+    }
+
+    Throwable reportFailure = null
+    try {
+        if (!fileExists(resultsFile)) {
+            error "runE2E: missing ${resultsFile}; the Playwright run produced no results"
+        }
+        if (!readFile(resultsFile).trim()) {
+            error "runE2E: empty ${resultsFile}; the Playwright run produced no results"
+        }
+        junit testResults: resultsFile, allowEmptyResults: false
         archiveArtifacts artifacts: 'tests/e2e-playwright/playwright-report/**, tests/e2e-playwright/test-results/**',
                          allowEmptyArchive: true
+    } catch (Throwable t) {
+        reportFailure = t
     }
+
+    if (originalFailure) {
+        if (reportFailure) {
+            echo "runE2E: report publication also failed: ${reportFailure.message}"
+        }
+        throw originalFailure
+    }
+    if (reportFailure) {
+        throw reportFailure
+    }
+}
+
+String q(String value) {
+    return "'" + value.replace("'", "'\\''") + "'"
 }

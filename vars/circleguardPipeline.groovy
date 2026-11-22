@@ -352,7 +352,6 @@ def call(Map rawConfig = [:]) {
                 }
             }
 
-            // HU-13: deploy of the published images to an AWS environment.
             stage('Deploy') {
                 when {
                     expression { cfg.deploy && cfg.deployBranches.contains(env.BRANCH_NAME) }
@@ -362,22 +361,26 @@ def call(Map rawConfig = [:]) {
                 }
                 steps {
                     script {
-                        // The same version that was published (never "latest").
-                        String version = env.IMAGE_VERSION ?: resolveVersion()
-                        env.IMAGE_VERSION = version
-                        String credentialId = cfg.deployCredentialId ?: "${cfg.environment}-credential"
-                        Map envCfg = deployEnvironment(
+                        if (!env.IMAGE_VERSION) {
+                            error 'circleguardPipeline: Deploy requires IMAGE_VERSION from Publish images'
+                        }
+                        Map deployed = deployKubernetes(
                             environment: cfg.environment,
-                            version: version,
-                            credentialId: credentialId
+                            context: cfg.contextFor(cfg.environment),
+                            namespace: cfg.namespaceFor(cfg.environment),
+                            registry: cfg.k8sRegistry,
+                            overlayPath: k8sOverlayPath(cfg, cfg.environment),
+                            kubeconfigCredentialId: cfg.kubeconfigCredentialId ?: "${cfg.environment}-kubeconfig",
+                            images: cfg.images,
+                            deployments: cfg.k8sDeployments,
+                            rolloutTimeout: cfg.k8sRolloutTimeout
                         )
-                        env.DEPLOY_HOST = envCfg.HOST
-                        currentBuild.description = "images ${version} -> ${cfg.environment}"
+                        env.K8S_MANIFEST = deployed.manifestArtifact
+                        currentBuild.description = "images ${env.IMAGE_VERSION} -> ${cfg.environment}"
                     }
                 }
             }
 
-            // HU-13: the deployment is only accepted if every component answers.
             stage('Verify deployment') {
                 when {
                     expression { cfg.deploy && cfg.deployBranches.contains(env.BRANCH_NAME) }
@@ -386,11 +389,11 @@ def call(Map rawConfig = [:]) {
                     timeout(time: cfg.verifyTimeout, unit: 'MINUTES')
                 }
                 steps {
-                    verifyServices(
-                        host: env.DEPLOY_HOST,
-                        services: cfg.services,
-                        retries: cfg.healthRetries,
-                        intervalSeconds: cfg.healthIntervalSeconds
+                    verifyIngress(
+                        baseUrl: k8sIngressUrl(cfg, cfg.environment),
+                        checks: cfg.k8sVerifyPaths,
+                        retries: cfg.verifyRetries,
+                        intervalSeconds: cfg.verifyIntervalSeconds
                     )
                 }
             }
@@ -406,7 +409,7 @@ def call(Map rawConfig = [:]) {
                 }
                 steps {
                     smokeTests(
-                        host: env.DEPLOY_HOST,
+                        baseUrl: k8sIngressUrl(cfg, cfg.environment),
                         environment: cfg.environment,
                         loginCredentialsId: cfg.smokeCredentialsId
                     )
@@ -426,11 +429,11 @@ def call(Map rawConfig = [:]) {
                     // A declarative steps{} block only accepts steps, so the
                     // variables must live inside a script{} block.
                     script {
-                        String base = "http://${env.DEPLOY_HOST}"
+                        String ingressUrl = k8sIngressUrl(cfg, cfg.environment)
                         runE2E(
-                            baseUrl: "${base}:8081",
-                            authBaseUrl: "${base}:8180",
-                            gatewayBaseUrl: "${base}:8087",
+                            baseUrl: ingressUrl,
+                            authBaseUrl: ingressUrl,
+                            gatewayBaseUrl: ingressUrl,
                             credentialsId: cfg.e2eCredentialsId,
                             image: cfg.e2eImage,
                             timeoutMinutes: cfg.e2eTimeout
@@ -439,7 +442,6 @@ def call(Map rawConfig = [:]) {
                 }
             }
 
-            // HU-14: dev -> stage, only after every previous validation passed.
             stage('Promote to stage') {
                 when {
                     expression { cfg.deploy && cfg.promote && cfg.deployBranches.contains(env.BRANCH_NAME) }
@@ -449,25 +451,33 @@ def call(Map rawConfig = [:]) {
                 }
                 steps {
                     script {
-                        Map envCfg = promoteEnvironment(
+                        Map promoted = promoteEnvironment(
                             from: 'dev',
                             to: 'stage',
                             version: env.IMAGE_VERSION,
                             manual: cfg.stageApproval,
                             approvalTimeout: cfg.approvalTimeout,
-                            services: cfg.services,
+                            kubeconfigCredentialId: cfg.kubeconfigCredentialId,
+                            context: cfg.contextFor('stage'),
+                            namespace: cfg.namespaceFor('stage'),
+                            registry: cfg.k8sRegistry,
+                            overlayPaths: cfg.k8sOverlayPaths,
+                            ingressUrls: cfg.k8sIngressUrls,
+                            images: cfg.images,
+                            deployments: cfg.k8sDeployments,
+                            verifyPaths: cfg.k8sVerifyPaths,
+                            rolloutTimeout: cfg.k8sRolloutTimeout,
+                            retries: cfg.verifyRetries,
+                            intervalSeconds: cfg.verifyIntervalSeconds,
                             smokeTests: cfg.smokeTests,
                             smokeCredentialsId: cfg.smokeCredentialsId,
-                            retries: cfg.healthRetries,
-                            intervalSeconds: cfg.healthIntervalSeconds,
                             evidenceFile: cfg.promotionRecordFile
                         )
-                        env.STAGE_HOST = envCfg.HOST
+                        env.STAGE_MANIFEST = promoted.manifestArtifact
                     }
                 }
             }
 
-            // HU-14: stage -> prod, always behind a manual approval (input).
             stage('Promote to prod') {
                 when {
                     expression { cfg.deploy && cfg.promote && cfg.deployBranches.contains(env.BRANCH_NAME) }
@@ -483,11 +493,20 @@ def call(Map rawConfig = [:]) {
                             version: env.IMAGE_VERSION,
                             manual: cfg.prodApproval,
                             approvalTimeout: cfg.approvalTimeout,
-                            services: cfg.services,
+                            kubeconfigCredentialId: cfg.kubeconfigCredentialId,
+                            context: cfg.contextFor('prod'),
+                            namespace: cfg.namespaceFor('prod'),
+                            registry: cfg.k8sRegistry,
+                            overlayPaths: cfg.k8sOverlayPaths,
+                            ingressUrls: cfg.k8sIngressUrls,
+                            images: cfg.images,
+                            deployments: cfg.k8sDeployments,
+                            verifyPaths: cfg.k8sVerifyPaths,
+                            rolloutTimeout: cfg.k8sRolloutTimeout,
+                            retries: cfg.verifyRetries,
+                            intervalSeconds: cfg.verifyIntervalSeconds,
                             smokeTests: cfg.smokeTests,
                             smokeCredentialsId: cfg.smokeCredentialsId,
-                            retries: cfg.healthRetries,
-                            intervalSeconds: cfg.healthIntervalSeconds,
                             evidenceFile: cfg.promotionRecordFile
                         )
                     }
@@ -606,4 +625,16 @@ void requireApprovalTimeLeft(long startedAtMs, int budgetMinutes, int approvalMi
     echo "terraformApproval: " +
          "${java.util.concurrent.TimeUnit.MILLISECONDS.toMinutes(remainingMs)} minute(s) left " +
          "of the ${budgetMinutes}-minute build budget"
+}
+
+String k8sOverlayPath(PipelineConfig cfg, String environment) {
+    return cfg.k8sOverlayPaths[environment] ?: "infra/k8s/overlays/${environment}"
+}
+
+String k8sIngressUrl(PipelineConfig cfg, String environment) {
+    String url = cfg.k8sIngressUrls[environment]
+    if (!url?.trim()) {
+        error "circleguardPipeline: k8sIngressUrls['${environment}'] is required"
+    }
+    return url.replaceAll('/+$', '')
 }
