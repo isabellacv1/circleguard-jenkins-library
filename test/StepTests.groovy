@@ -117,6 +117,30 @@ def writeTestFile = { File file, String text ->
     return file
 }
 
+def fakeKubectl = { File dir ->
+    File bin = new File(dir, 'bin')
+    bin.mkdirs()
+    File argvLog = new File(dir, 'argv.log')
+    File script = new File(bin, 'kubectl')
+    writeTestFile(script, '''#!/bin/bash
+printf '%s\\n' "$*" >> "$ARGV_LOG"
+case "$*" in
+  *"config view"*) printf '%s' "$FAKE_KUBECONFIG_CONTENT" ;;
+  *"config current-context"*) printf '%s\\n' "$K8S_CONTEXT" ;;
+  *"config set-context"*)
+    awk -v u="$K8S_KUBECONFIG_USER" -v c="$K8S_CONTEXT" '
+      /^current-context:/ { print "current-context: " c; next }
+      /^    user: / && !done { print "    user: " u; done = 1; next }
+      { print }
+    ' "$K8S_KUBECONFIG_FILE" > "$K8S_KUBECONFIG_FILE.ctx" && mv "$K8S_KUBECONFIG_FILE.ctx" "$K8S_KUBECONFIG_FILE"
+    ;;
+esac
+exit 0
+''')
+    script.setExecutable(true)
+    return [bin: bin, argvLog: argvLog]
+}
+
 def runShell = { String scriptText, File cwd, Map envVars = [:], String prependPath = null ->
     ProcessBuilder pb = new ProcessBuilder('bash', '-c', scriptText)
     pb.directory(cwd)
@@ -155,6 +179,7 @@ def runShell = { String scriptText, File cwd, Map envVars = [:], String prependP
  * opts.failScan             when true, the trivyImageScan stub throws (checks the push gate)
  * opts.inputResult          value returned by the stubbed input step ('admin' default)
  * opts.failInput            Throwable thrown by the stubbed input step (expired/cancelled)
+ * opts.credentialValues     fake values bound by withCredentials, to detect leakage
  */
 def newStep = { String name, Map opts = [:] ->
     def script = loader.parseClass(new File(root, "vars/${name}.groovy")).newInstance()
@@ -173,6 +198,7 @@ def newStep = { String name, Map opts = [:] ->
         currentBuild: [description: ''],
         shellOutputs: [],
         shellCodes: [],
+        deployKubernetesParams: [],
         trace   : []     // ordered: sh commands + stubbed sibling steps (order assertions)
     ]
     def binding = new Binding()
@@ -241,13 +267,35 @@ def newStep = { String name, Map opts = [:] ->
         return body.call()
     })
     // withCredentials records the bindings, runs the body and returns its value,
-    // like the real step; usernamePassword() returns its arguments, so a test can
-    // assert the credential id and the variable names WITHOUT reading any secret.
+    // like the real step; credential helpers return their arguments, so a test can
+    // assert ids and variable names WITHOUT reading any secret. Fake values are
+    // injected into env only to detect accidental interpolation into logs.
     binding.setVariable('usernamePassword', { Object args -> args })
     binding.setVariable('file', { Object args -> args })
+    binding.setVariable('string', { Object args -> args })
     binding.setVariable('withCredentials', { Object bindings, Closure body ->
         b.withCredentials << bindings
-        return body.call()
+        Map previous = [:]
+        List specs = (bindings instanceof List) ? bindings : [bindings]
+        specs.each { Object spec ->
+            if (spec instanceof Map && spec.variable != null) {
+                String variable = spec.variable.toString()
+                previous[variable] = b.env.containsKey(variable) ? b.env[variable] : null
+                Object configured = (opts.credentialValues ?: [:])[variable]
+                b.env[variable] = (configured ?: "FAKE_${variable}").toString()
+            }
+        }
+        try {
+            return body.call()
+        } finally {
+            previous.each { String variable, Object value ->
+                if (value == null) {
+                    b.env.remove(variable)
+                } else {
+                    b.env[variable] = value
+                }
+            }
+        }
     })
     // terraformPlan reuses the free-space parser of terraformValidate: the real
     // step is bound so that terraformValidate.freeSpaceMB() is the production one.
@@ -310,6 +358,7 @@ def newStep = { String name, Map opts = [:] ->
         }
     })
     binding.setVariable('deployKubernetes', { Map p ->
+        b.deployKubernetesParams << p
         b.trace << "deployKubernetes(${p.environment})"
         [manifestArtifact: "k8s/rendered-${p.environment}-${b.env.BUILD_NUMBER ?: 'local'}.yaml"]
     })
@@ -322,10 +371,11 @@ def newStep = { String name, Map opts = [:] ->
         []
     })
 
-    [script: script, sh: b.sh, logs: b.logs, archived: b.archived, written: b.written,
-     env: b.env, withEnv: b.withEnv, withCredentials: b.withCredentials, junit: b.junit,
-     inputs: b.inputs, trace: b.trace, currentBuild: b.currentBuild,
-     shellOutputs: b.shellOutputs, shellCodes: b.shellCodes]
+     [script: script, sh: b.sh, logs: b.logs, archived: b.archived, written: b.written,
+      env: b.env, withEnv: b.withEnv, withCredentials: b.withCredentials, junit: b.junit,
+      inputs: b.inputs, trace: b.trace, currentBuild: b.currentBuild,
+      deployKubernetesParams: b.deployKubernetesParams,
+      shellOutputs: b.shellOutputs, shellCodes: b.shellCodes]
 }
 
 println 'runInContainer'
@@ -2675,6 +2725,21 @@ def newConfig = { Map m ->
     }
 }
 
+test('accepts the Kubernetes kubeconfig and token credential ids from the Jenkinsfile') {
+    def cfg = newConfig([deploy: true, environment: 'dev',
+                         k8sContexts: [dev: 'cg-dev'],
+                         k8sIngressUrls: [dev: 'http://ingress.example'],
+                         kubeconfigCredentialId: 'custom-kubeconfig',
+                         k8sTokenCredentialId: 'custom-k8s-token'])
+
+    assert cfg.kubeconfigCredentialId == 'custom-kubeconfig'
+    assert cfg.k8sTokenCredentialId == 'custom-k8s-token'
+
+    def defaults = newConfig([:])
+    assert defaults.kubeconfigCredentialId == null
+    assert defaults.k8sTokenCredentialId == null
+}
+
 test('keeps the Terraform approval and the PROD target disabled by default') {
     def cfg = newConfig([:])
 
@@ -3489,8 +3554,313 @@ test('deploys the build version with an explicit context and no prune') {
     assert h.sh.any { it.contains("rm -rf 'infra/k8s/overlays/.deploy-dev-42'") }
     assert h.archived.contains('k8s/rendered-dev-42.yaml')
     assert h.withCredentials[0][0].credentialsId == 'dev-kubeconfig'
+    assert h.withCredentials[0][1].credentialsId == 'dev-k8s-token'
     assert h.sh.any { it.contains('kustomize renders local files only') } ||
            new File(root, 'vars/deployKubernetes.groovy').text.contains('renders local files only')
+}
+
+test('injects the ServiceAccount token into a temporary kubeconfig without logging it') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    String fakeToken = 'FAKE_SA_TOKEN_MUST_NOT_APPEAR'
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                         stdout: 'cg-dev',
+                                         credentialValues: [K8S_TOKEN: fakeToken]])
+
+    h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                  registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                  images: images, deployments: names)
+
+    Map kubeconfigCredential = h.withCredentials[0][0]
+    Map tokenCredential = h.withCredentials[0][1]
+    assert kubeconfigCredential.credentialsId == 'dev-kubeconfig'
+    assert kubeconfigCredential.variable == 'KUBECONFIG_TEMPLATE'
+    assert tokenCredential.credentialsId == 'dev-k8s-token'
+    assert tokenCredential.variable == 'K8S_TOKEN'
+
+    String tempKubeconfig = 'infra/k8s/overlays/.deploy-dev-42/kubeconfig'
+    assert h.sh.any { it.contains('kubectl config view --minify --raw --kubeconfig "${KUBECONFIG_TEMPLATE}"') }
+    assert h.sh.any { it.contains('ENVIRON["K8S_TOKEN"]') }
+    assert h.sh.any { it.contains('chmod 600 "${K8S_KUBECONFIG_FILE}"') }
+    assert h.withEnv.flatten().any { it == "KUBECONFIG=${tempKubeconfig}" }
+    assert h.sh.any { it.contains('kubectl config set-context "${K8S_CONTEXT}" --user "${K8S_KUBECONFIG_USER}"') }
+
+    String source = new File(root, 'vars/deployKubernetes.groovy').text
+    assert !source.contains('set-credentials')
+    assert !source.contains('--token')
+    assert !source.contains('delete-user')
+    assert source.contains('command -v awk')
+    assert source.contains('certificate-authority-data')
+    assert !h.sh.any { it.contains('--token') }
+
+    int injection = h.sh.findIndexOf { it.contains('ENVIRON["K8S_TOKEN"]') }
+    int contextCheck = h.sh.findIndexOf { it.contains('config current-context') }
+    int dryRun = h.sh.findIndexOf { it.contains('apply --dry-run=server -k') }
+    assert injection >= 0 && injection < contextCheck && contextCheck < dryRun
+
+    List credentialEvidence = h.withCredentials.collect { List specs -> specs.collect { it.toString() } }.flatten()
+    String allEvidence = (h.sh + h.logs + h.archived + h.withEnv +
+                          h.written.collect { k, v -> "${k}=${v}" } + credentialEvidence).join('\n')
+    assert !allEvidence.contains(fakeToken): 'the ServiceAccount token must never reach logs or artifacts'
+}
+
+test('rejects a missing token credential before binding any credential') {
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42']])
+    try {
+        h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                      k8sTokenCredentialId: '   ')
+        assert false: 'a blank token credential must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('k8sTokenCredentialId is required'): e.message
+    }
+    assert h.withCredentials.isEmpty(): 'no credential may be bound before validation'
+    assert h.sh.isEmpty()
+}
+
+test('cleans the temporary kubeconfig when token injection fails') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                         stdout: 'cg-dev', failShContains: 'kubectl config view --minify'])
+    try {
+        h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                      images: images, deployments: names)
+        assert false: 'a token injection failure must fail the deploy'
+    } catch (RuntimeException e) {
+        assert e.message.contains('simulated command failure'): e.message
+    }
+    assert h.sh.any { it.contains("rm -f 'infra/k8s/overlays/.deploy-dev-42/kubeconfig'") }
+    assert h.sh.any { it.contains("rm -rf 'infra/k8s/overlays/.deploy-dev-42'") }
+    assert h.sh.every { !it.contains('apply --dry-run=server -k') }
+    assert h.sh.every { !it.contains(' rollout status deployment/') }
+}
+
+test('never exposes the token in real process argv and keeps the original kubeconfig unchanged') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    String fakeToken = 'FAKE_SA_TOKEN_REAL_ARGV_MUST_NOT_APPEAR'
+    String originalKubeconfig = '''apiVersion: v1
+kind: Config
+clusters:
+- name: cg
+  cluster:
+    certificate-authority-data: Y2E=
+    server: https://127.0.0.1
+contexts:
+- name: cg-dev
+  context:
+    cluster: cg
+    user: original
+current-context: cg-dev
+users:
+- name: original
+  user: {}
+'''
+    File work = newTempDir('kube-argv-')
+    File overlay = new File(work, 'infra/k8s/overlays/dev')
+    overlay.mkdirs()
+    File tempDir = new File(overlay.parentFile, '.deploy-dev-42')
+    tempDir.mkdirs()
+    File sourceKubeconfig = writeTestFile(new File(work, 'source-kubeconfig'), originalKubeconfig)
+    File generated = new File(tempDir, 'kubeconfig')
+    Map fake = fakeKubectl(work)
+    File bin = fake.bin
+    File argvLog = fake.argvLog
+
+    def h = newStep('deployKubernetes', [
+        env           : [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+        stdout        : 'cg-dev',
+        realShContains: ['kubectl config view --minify', 'ENVIRON["K8S_TOKEN"]',
+                         'chmod 600', 'kubectl config set-context',
+                         'kubectl config current-context', 'apply --dry-run=server -k',
+                         'apply -k', 'rollout status deployment/'],
+        realShPath    : bin.absolutePath,
+        realShEnv     : [ARGV_LOG              : argvLog.absolutePath,
+                         KUBECONFIG_TEMPLATE   : sourceKubeconfig.absolutePath,
+                         FAKE_KUBECONFIG_CONTENT: originalKubeconfig,
+                         K8S_TOKEN             : fakeToken,
+                         K8S_CONTEXT           : 'cg-dev',
+                         K8S_NAMESPACE         : 'circleguard',
+                         K8S_KUBECONFIG_FILE   : generated.absolutePath,
+                         K8S_KUBECONFIG_USER   : 'jenkins-k8s-token']
+    ])
+
+    h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                  registry: '10.20.1.230:8082', overlayPath: overlay.absolutePath,
+                  images: images, deployments: names)
+
+    String argv = argvLog.text
+    assert argv.contains('config view --minify')
+    assert !argv.contains(fakeToken): "token leaked in process argv: ${argv}"
+    assert sourceKubeconfig.text == originalKubeconfig: 'the Secret file copy must remain untouched'
+    assert !sourceKubeconfig.text.contains(fakeToken)
+    String generatedKubeconfig = generated.text
+    assert generatedKubeconfig.contains(fakeToken): 'the generated kubeconfig must carry the token'
+    assert generatedKubeconfig.contains('current-context: cg-dev')
+    assert generatedKubeconfig.contains('- name: cg-dev\n  context:\n    cluster: cg\n    user: jenkins-k8s-token')
+    assert generatedKubeconfig.contains('- name: cg\n  cluster:\n    certificate-authority-data: Y2E=')
+    assert generatedKubeconfig.contains('- name: jenkins-k8s-token\n  user:\n    token: "' + fakeToken + '"')
+    assert generatedKubeconfig.count('- name: jenkins-k8s-token') == 1
+    assert generatedKubeconfig.contains('- name: original')
+    Set<java.nio.file.attribute.PosixFilePermission> permissions =
+        java.nio.file.Files.getPosixFilePermissions(generated.toPath())
+    assert permissions.contains(java.nio.file.attribute.PosixFilePermission.OWNER_READ)
+    assert permissions.contains(java.nio.file.attribute.PosixFilePermission.OWNER_WRITE)
+    assert !permissions.contains(java.nio.file.attribute.PosixFilePermission.GROUP_READ)
+    assert !permissions.contains(java.nio.file.attribute.PosixFilePermission.OTHERS_READ)
+}
+
+test('rejects invalid token, duplicate user and kubeconfig without embedded CA') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    String validKubeconfig = '''apiVersion: v1
+kind: Config
+clusters:
+- name: cg
+  cluster:
+    certificate-authority-data: Y2E=
+    server: https://127.0.0.1
+contexts:
+- name: cg-dev
+  context:
+    cluster: cg
+    user: original
+current-context: cg-dev
+users:
+- name: original
+  user: {}
+'''
+    String duplicateUserKubeconfig = validKubeconfig + '''- name: jenkins-k8s-token
+  user: {}
+'''
+    String noCaKubeconfig = validKubeconfig.replace('    certificate-authority-data: Y2E=\n', '')
+    [
+        [name: 'invalid token', token: 'BAD TOKEN', fixture: validKubeconfig,
+         expected: 'unsupported characters'],
+        [name: 'duplicate user', token: 'VALID.TOKEN-123', fixture: duplicateUserKubeconfig,
+         expected: 'already contains user'],
+        [name: 'missing CA', token: 'VALID.TOKEN-123', fixture: noCaKubeconfig,
+         expected: 'certificate-authority-data']
+    ].each { Map scenario ->
+        File work = newTempDir('kube-harden-')
+        File overlay = new File(work, 'infra/k8s/overlays/dev')
+        overlay.mkdirs()
+        File tempDir = new File(overlay.parentFile, '.deploy-dev-42')
+        tempDir.mkdirs()
+        File sourceKubeconfig = writeTestFile(new File(work, 'source-kubeconfig'), scenario.fixture)
+        File generated = new File(tempDir, 'kubeconfig')
+        Map fake = fakeKubectl(work)
+        def h = newStep('deployKubernetes', [
+            env           : [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+            stdout        : 'cg-dev',
+            realShContains: ['kubectl config view --minify'],
+            realShPath    : fake.bin.absolutePath,
+            realShEnv     : [ARGV_LOG               : fake.argvLog.absolutePath,
+                             KUBECONFIG_TEMPLATE    : sourceKubeconfig.absolutePath,
+                             FAKE_KUBECONFIG_CONTENT: scenario.fixture,
+                             K8S_TOKEN              : scenario.token,
+                             K8S_CONTEXT            : 'cg-dev',
+                             K8S_NAMESPACE          : 'circleguard',
+                             K8S_KUBECONFIG_FILE    : generated.absolutePath,
+                             K8S_KUBECONFIG_USER    : 'jenkins-k8s-token']
+        ])
+        try {
+            h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                          registry: '10.20.1.230:8082', overlayPath: overlay.absolutePath,
+                          images: images, deployments: names)
+            assert false: "${scenario.name} must fail"
+        } catch (RuntimeException e) {
+            assert e.message.contains(scenario.expected): "${scenario.name}: ${e.message}"
+        }
+        String argv = fake.argvLog.exists() ? fake.argvLog.text : ''
+        assert !argv.contains(scenario.token)
+        assert !h.logs.any { it.toString().contains(scenario.token) }
+        assert !generated.exists() || !generated.text.contains(scenario.token)
+    }
+}
+
+test('cleans the temporary kubeconfig when the server dry-run fails') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                         stdout: 'cg-dev',
+                                         failShContains: 'apply --dry-run=server -k'])
+    try {
+        h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                      images: images, deployments: names)
+        assert false: 'a server dry-run failure must fail the deploy'
+    } catch (RuntimeException e) {
+        assert e.message.contains('simulated command failure'): e.message
+    }
+    assert h.sh.any { it.contains("rm -f 'infra/k8s/overlays/.deploy-dev-42/kubeconfig'") }
+    assert h.sh.any { it.contains("rm -rf 'infra/k8s/overlays/.deploy-dev-42'") }
+    assert h.sh.every { !it.contains(' apply -k ') }
+    assert h.sh.every { !it.contains(' rollout status deployment/') }
+}
+
+test('reports a cleanup failure without hiding the original deploy error') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                         stdout: 'cg-dev',
+                                         failShContainsList: [
+                                             [contains: 'apply --dry-run=server -k',
+                                              message : 'ORIGINAL DEPLOY ERROR'],
+                                             [contains: "rm -f 'infra/k8s/overlays/.deploy-dev-42/kubeconfig'",
+                                              message : 'CLEANUP ERROR']]])
+    try {
+        h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                      images: images, deployments: names)
+        assert false: 'cleanup must not hide a deploy error'
+    } catch (RuntimeException e) {
+        assert e.message.contains('ORIGINAL DEPLOY ERROR'): e.message
+    }
+    assert h.logs.any { it.toString().contains('WARNING cleanup failed') &&
+                        it.toString().contains('CLEANUP ERROR') }
+}
+
+test('fails when cleanup fails after a successful deploy') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                         stdout: 'cg-dev',
+                                         failShContains: "rm -f 'infra/k8s/overlays/.deploy-dev-42/kubeconfig'",
+                                         failShMessage: 'CLEANUP ERROR'])
+    try {
+        h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                      images: images, deployments: names)
+        assert false: 'a cleanup failure after success must fail the deploy'
+    } catch (RuntimeException e) {
+        assert e.message.contains('cleanup failed after deploy'): e.message
+    }
+    assert h.logs.any { it.toString().contains('WARNING cleanup failed') &&
+                        it.toString().contains('CLEANUP ERROR') }
 }
 
 test('apply and rollout use the manifest namespace and overrides are rejected') {
@@ -3991,11 +4361,14 @@ test('promotes with Kubernetes, keeps the approval and records evidence') {
 
     h.script.call(from: 'dev', to: 'stage', version: '1.0.0-dev.15', manual: true,
                   context: 'cg-stage', namespace: 'circleguard', registry: '10.20.1.230:8082',
-                  overlayPaths: [:], ingressUrls: [stage: 'http://stage.example/'],
-                  images: [[name: 'circleguard/web']], deployments: names,
-                  verifyPaths: [[name: 'web', path: '/', expected: '200']],
-                  smokeTests: true, smokeCredentialsId: 'e2e-credential')
+                   overlayPaths: [:], ingressUrls: [stage: 'http://stage.example/'],
+                   kubeconfigCredentialId: 'stage-kubeconfig', k8sTokenCredentialId: 'stage-k8s-token',
+                   images: [[name: 'circleguard/web']], deployments: names,
+                   verifyPaths: [[name: 'web', path: '/', expected: '200']],
+                   smokeTests: true, smokeCredentialsId: 'e2e-credential')
 
+    assert h.deployKubernetesParams[0].kubeconfigCredentialId == 'stage-kubeconfig'
+    assert h.deployKubernetesParams[0].k8sTokenCredentialId == 'stage-k8s-token'
     assert h.trace.any { it == 'deployKubernetes(stage)' }
     assert h.trace.any { it == 'verifyIngress(http://stage.example)' }
     assert h.trace.any { it == 'smokeTests(http://stage.example)' }
@@ -4013,6 +4386,21 @@ test('promotes with Kubernetes, keeps the approval and records evidence') {
     assert record.contains('Namespace    : circleguard')
     assert record.contains('Manifest     : k8s/rendered-stage-42.yaml')
     assert h.archived.contains('promotion-record.txt')
+}
+
+test('derives kubeconfig and token credentials for each promotion target') {
+    ['stage', 'prod'].each { String to ->
+        def h = newStep('promoteEnvironment', [env: [IMAGE_VERSION: '1.0.0-dev.15',
+                                                     BUILD_NUMBER: '42', BRANCH_NAME: 'dev']])
+        h.script.call(from: (to == 'stage' ? 'dev' : 'stage'), to: to,
+                      version: '1.0.0-dev.15', context: "cg-${to}", namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', ingressUrls: [(to): "http://${to}.example"],
+                      images: [[name: 'circleguard/web']], deployments: ['circleguard-web'],
+                      smokeTests: false)
+        assert h.deployKubernetesParams[0].environment == to
+        assert h.deployKubernetesParams[0].kubeconfigCredentialId == "${to}-kubeconfig"
+        assert h.deployKubernetesParams[0].k8sTokenCredentialId == "${to}-k8s-token"
+    }
 }
 
 test('requires env.IMAGE_VERSION and never derives it from the version argument') {
@@ -4077,6 +4465,8 @@ test('the pipeline keeps its stages and uses only the Kubernetes deploy path') {
     }
 
     assert text.contains('deployKubernetes(')
+    assert text.contains('k8sTokenCredentialId: cfg.k8sTokenCredentialId ?: "${cfg.environment}-k8s-token"')
+    assert text.contains('k8sTokenCredentialId: cfg.k8sTokenCredentialId,')
     assert text.contains('verifyIngress(')
     assert text.contains('smokeTests(')
     assert text.contains('baseUrl: ingressUrl')

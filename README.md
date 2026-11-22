@@ -60,7 +60,8 @@ circleguardPipeline(
 | `deploy` | `false` | Deploys the published images to Kubernetes with Kustomize (requires `publish: true`). |
 | `environment` | `dev` | Target environment: `dev`, `stage` or `prod`. |
 | `deployBranches` | `['dev']` | Branches that run the deploy and verification stages. |
-| `kubeconfigCredentialId` | `${environment}-kubeconfig` | Jenkins Secret file credential with the kubeconfig. Promotions pass the same override; when unset they derive `${to}-kubeconfig`. |
+| `kubeconfigCredentialId` | `${environment}-kubeconfig` | Jenkins Secret file credential with cluster server, CA and context, **without a token**. Promotions pass the same override; when unset they derive `${to}-kubeconfig`. |
+| `k8sTokenCredentialId` | `${environment}-k8s-token` | Jenkins Secret text credential with the Kubernetes ServiceAccount token. Promotions pass the same override; when unset they derive `${to}-k8s-token`. |
 | `k8sContext` | required when `deploy` | Default kubectl context. Used explicitly by every command that interacts with the cluster. |
 | `k8sNamespace` | `circleguard` | Fixed application namespace; any other value is rejected because the manifests hardcode `metadata.namespace: circleguard`. |
 | `k8sContexts` | `[:]` | Per-environment context map (`dev`, `stage`, `prod`); overrides `k8sContext`. |
@@ -119,27 +120,54 @@ circleguardPipeline(
 | `terraformApplyProd` | `false` | PROD apply switch: **off**. Independent from `terraformApprovalProd`. |
 | `terraformApprovalProd` | `false` | PROD approval switch: **off**. Both PROD switches must be enabled explicitly. |
 
-**Kubernetes credentials.** The deploy and promotion stages need the Jenkins
-**Secret file** credential `<environment>-kubeconfig` (`dev-kubeconfig`,
-`stage-kubeconfig`, `prod-kubeconfig`). It is bound with `withCredentials` only
-around the kubectl commands. `kubectl kustomize` is a **local render** of the
-copied **application** overlay and deliberately has no `--context`/`--namespace`;
-every command that interacts with the cluster passes both flags explicitly. The
-rendered output is validated **before archiving and before the server dry-run or
-apply**: it must not be empty, every resource must have `metadata.namespace:
-circleguard`, and the only allowed kinds are `ConfigMap`, `Deployment`, `Service`,
-`Ingress` and `PersistentVolumeClaim`. Namespaces, RBAC, quotas, NetworkPolicies
-and observability belong to `infra/k8s/platform/overlays/<env>` and are applied
-by infrastructure, not by this library. The active context is checked after the
+**Kubernetes credentials.** The deploy and promotion stages need two Jenkins
+credentials: `kubeconfigCredentialId`, a **Secret file** (`dev-kubeconfig`,
+`stage-kubeconfig`, `prod-kubeconfig`) containing cluster server, CA data and
+context but **no token**, and `k8sTokenCredentialId`, a **Secret text**
+(`dev-k8s-token`, `stage-k8s-token`, `prod-k8s-token`) containing the Kubernetes
+ServiceAccount token. Both are bound with `withCredentials` only for the
+Kubernetes phase, after the local render and manifest archive. `deployKubernetes`
+writes a minified copy of the Secret file to a workspace-local temporary file,
+adds a `jenkins-k8s-token` user whose token is read by `awk` from `K8S_TOKEN`
+through `ENVIRON`, and never passes the token as a process argument: no
+`kubectl config set-credentials --token`, no shell trace and no console output.
+The generated kubeconfig is created under `umask 077` and forced to mode `600`.
+Before using it, the step requires `awk`, accepts only token characters from
+`[A-Za-z0-9._-]`, verifies embedded `certificate-authority-data` and fails if
+`jenkins-k8s-token` already exists in the copied config. The copy is exposed as
+`KUBECONFIG` only while running `kubectl config
+current-context`, `apply --dry-run=server -k`, `apply -k` and `rollout status`.
+The original Secret file is only read, never modified. The temporary overlay and
+kubeconfig are removed in `finally` on every path; a cleanup failure is reported
+and, if there was no earlier error, fails the build, otherwise the original error
+is rethrown unchanged.
+
+`kubectl kustomize` is a **local render** of the copied **application** overlay
+and deliberately has no `--context`/`--namespace`; every command that interacts
+with the cluster passes both flags explicitly. The rendered output is validated
+**before archiving and before the server dry-run or apply**: it must not be
+empty, every resource must have `metadata.namespace: circleguard`, and the only
+allowed kinds are `ConfigMap`, `Deployment`, `Service`, `Ingress` and
+`PersistentVolumeClaim`. Namespaces, RBAC, quotas, NetworkPolicies and
+observability belong to `infra/k8s/platform/overlays/<env>` and are applied by
+infrastructure, not by this library. The active context is checked after the
 local render but **before** the server dry-run and apply, so no cluster mutation
 can happen under the wrong context. The application Secrets and the registry pull
 Secret are expected to already exist in the target namespace; the library does
 not create, modify or print them. Contexts can be set per environment with
 `k8sContexts`; namespaces cannot: every application manifest hardcodes
 `metadata.namespace: circleguard`, so `k8sNamespace`/`k8sNamespaces` selecting
-anything else is rejected before any stage runs. `kubeconfigCredentialId`
-overrides the id in `circleguardPipeline` and is also passed to promotions, while
-the default for promotions is `${to}-kubeconfig`.
+anything else is rejected before any stage runs. `kubeconfigCredentialId` and
+`k8sTokenCredentialId` override the ids in `circleguardPipeline` and are also
+passed to promotions, while the defaults for promotions are `${to}-kubeconfig`
+and `${to}-k8s-token`.
+
+**Renewal limitation:** this design does **not** mint or refresh tokens. The
+Jenkins Secret text is static for the duration of a build and between builds;
+rotation is manual or external, not automatic. The token must stay valid for the
+whole Deploy stage (`deployTimeout` plus `k8sRolloutTimeout` and margin).
+Automatic TokenRequest-based renewal would require additional RBAC and a
+token-minter bootstrap credential; it is not implemented here.
 
 ### Stages
 

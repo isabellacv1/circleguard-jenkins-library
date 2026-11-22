@@ -371,6 +371,7 @@ def call(Map rawConfig = [:]) {
                             registry: cfg.k8sRegistry,
                             overlayPath: k8sOverlayPath(cfg, cfg.environment),
                             kubeconfigCredentialId: cfg.kubeconfigCredentialId ?: "${cfg.environment}-kubeconfig",
+                            k8sTokenCredentialId: cfg.k8sTokenCredentialId ?: "${cfg.environment}-k8s-token",
                             images: cfg.images,
                             deployments: cfg.k8sDeployments,
                             rolloutTimeout: cfg.k8sRolloutTimeout
@@ -458,6 +459,7 @@ def call(Map rawConfig = [:]) {
                             manual: cfg.stageApproval,
                             approvalTimeout: cfg.approvalTimeout,
                             kubeconfigCredentialId: cfg.kubeconfigCredentialId,
+                            k8sTokenCredentialId: cfg.k8sTokenCredentialId,
                             context: cfg.contextFor('stage'),
                             namespace: cfg.namespaceFor('stage'),
                             registry: cfg.k8sRegistry,
@@ -494,6 +496,7 @@ def call(Map rawConfig = [:]) {
                             manual: cfg.prodApproval,
                             approvalTimeout: cfg.approvalTimeout,
                             kubeconfigCredentialId: cfg.kubeconfigCredentialId,
+                            k8sTokenCredentialId: cfg.k8sTokenCredentialId,
                             context: cfg.contextFor('prod'),
                             namespace: cfg.namespaceFor('prod'),
                             registry: cfg.k8sRegistry,

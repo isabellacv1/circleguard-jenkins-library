@@ -33,6 +33,7 @@ class PipelineConfig implements Serializable {
     String environment = 'dev'
     List<String> deployBranches = ['dev']
     String kubeconfigCredentialId = null
+    String k8sTokenCredentialId = null
     String k8sContext = ''
     String k8sNamespace = 'circleguard'
     Map<String, String> k8sContexts = [:]
@@ -180,6 +181,7 @@ class PipelineConfig implements Serializable {
         this.environment = c.environment ?: this.environment
         this.deployBranches = c.deployBranches ?: this.deployBranches
         this.kubeconfigCredentialId = c.kubeconfigCredentialId ?: (c.containsKey('kubeconfigCredentialId') ? c.kubeconfigCredentialId : null)
+        this.k8sTokenCredentialId = c.k8sTokenCredentialId ?: (c.containsKey('k8sTokenCredentialId') ? c.k8sTokenCredentialId : null)
         this.k8sContext = c.k8sContext ?: this.k8sContext
         this.k8sNamespace = c.k8sNamespace ?: this.k8sNamespace
         this.k8sContexts = c.k8sContexts ?: this.k8sContexts

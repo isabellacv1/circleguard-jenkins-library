@@ -12,12 +12,19 @@ def call(Map params = [:]) {
     String registry = params.registry
     String overlayPath = params.overlayPath
     String kubeconfigCredentialId = params.kubeconfigCredentialId ?: "${environment}-kubeconfig"
+    String tokenCredentialId = params.k8sTokenCredentialId ?: "${environment}-k8s-token"
     List<Map> images = params.images ?: []
     List<String> deployments = params.deployments ?: []
     int rolloutTimeout = params.rolloutTimeout ?: 300
 
     if (!version?.trim() || version == 'latest') {
         error 'deployKubernetes: env.IMAGE_VERSION must be a semantic version from this build'
+    }
+    if (!kubeconfigCredentialId?.trim()) {
+        error 'deployKubernetes: kubeconfigCredentialId is required'
+    }
+    if (!tokenCredentialId?.trim()) {
+        error 'deployKubernetes: k8sTokenCredentialId is required'
     }
     if (!context?.trim()) {
         error 'deployKubernetes: context is required'
@@ -52,45 +59,104 @@ def call(Map params = [:]) {
     String manifest = params.manifestArtifact ?: "k8s/rendered-${suffix}.yaml"
     String manifestParent = new File(manifest).parent ?: '.'
 
-    withCredentials([file(credentialsId: kubeconfigCredentialId, variable: 'KUBECONFIG')]) {
-        try {
-            sh "mkdir -p ${q(manifestParent)}"
-            sh "rm -rf ${q(tempDir)}"
-            sh "cp -R ${q(overlayPath)} ${q(tempDir)}"
+    String kubeconfigFile = new File(tempDir, 'kubeconfig').path
+    String kubeconfigUser = 'jenkins-k8s-token'
+    Throwable originalFailure = null
 
-            images.each { Map image ->
-                String name = image.name
-                if (!name?.trim()) {
-                    error 'deployKubernetes: every image needs a name'
-                }
-                String mapping = "${registry}/${name}=${registry}/${name}:${version}"
-                sh "cd ${q(tempDir)} && kustomize edit set image ${q(mapping)}"
+    try {
+        sh "mkdir -p ${q(manifestParent)}"
+        sh "rm -rf ${q(tempDir)}"
+        sh "cp -R ${q(overlayPath)} ${q(tempDir)}"
+
+        images.each { Map image ->
+            String name = image.name
+            if (!name?.trim()) {
+                error 'deployKubernetes: every image needs a name'
             }
-
-            // kustomize renders local files only: no cluster access, therefore no
-            // --context/--namespace. Every command below that touches the cluster
-            // passes both flags explicitly.
-            String renderedManifest = sh(script: "kubectl kustomize ${q(tempDir)}", returnStdout: true)
-            validateRenderedManifest(renderedManifest, environment, overlayPath)
-            writeFile file: manifest, text: renderedManifest
-            archiveArtifacts artifacts: manifest, allowEmptyArchive: false
-
-            String active = sh(script: 'kubectl config current-context', returnStdout: true).trim()
-            if (active != context) {
-                error "deployKubernetes: expected kubectl context '${context}', got '${active}'"
-            }
-
-            sh "kubectl --context ${q(context)} --namespace ${q(namespace)} apply --dry-run=server -k ${q(tempDir)}"
-            sh "kubectl --context ${q(context)} --namespace ${q(namespace)} apply -k ${q(tempDir)}"
-            echo "Applied ${environment} manifests from ${tempDir} (no prune)"
-
-            deployments.each { String deployment ->
-                sh "kubectl --context ${q(context)} --namespace ${q(namespace)} rollout status deployment/${deployment} --timeout=${rolloutTimeout}s"
-            }
-            echo "All ${deployments.size()} deployments rolled out in namespace ${namespace}"
-        } finally {
-            sh "rm -rf ${q(tempDir)} || true"
+            String mapping = "${registry}/${name}=${registry}/${name}:${version}"
+            sh "cd ${q(tempDir)} && kustomize edit set image ${q(mapping)}"
         }
+
+        // kustomize renders local files only: no cluster access, therefore no
+        // --context/--namespace. Every command below that touches the cluster
+        // uses the temporary kubeconfig and passes both flags explicitly.
+        String renderedManifest = sh(script: "kubectl kustomize ${q(tempDir)}", returnStdout: true)
+        validateRenderedManifest(renderedManifest, environment, overlayPath)
+        writeFile file: manifest, text: renderedManifest
+        archiveArtifacts artifacts: manifest, allowEmptyArchive: false
+
+        withCredentials([
+            file(credentialsId: kubeconfigCredentialId, variable: 'KUBECONFIG_TEMPLATE'),
+            string(credentialsId: tokenCredentialId, variable: 'K8S_TOKEN')
+        ]) {
+            withEnv([
+                "KUBECONFIG=${kubeconfigFile}",
+                "K8S_CONTEXT=${context}",
+                "K8S_NAMESPACE=${namespace}",
+                "K8S_KUBECONFIG_FILE=${kubeconfigFile}",
+                "K8S_KUBECONFIG_USER=${kubeconfigUser}"
+            ]) {
+                sh """set +x; set -e
+umask 077
+if ! command -v awk >/dev/null 2>&1; then
+  echo "deployKubernetes: awk is required to build the temporary kubeconfig" >&2
+  exit 1
+fi
+case "\${K8S_TOKEN}" in
+  ''|*[!A-Za-z0-9._-]*)
+    echo "deployKubernetes: K8S_TOKEN is empty or contains unsupported characters" >&2
+    exit 1
+    ;;
+esac
+kubectl config view --minify --raw --kubeconfig "\${KUBECONFIG_TEMPLATE}" --context "\${K8S_CONTEXT}" -o yaml > "\${K8S_KUBECONFIG_FILE}"
+if ! awk '/^[[:space:]]+certificate-authority-data:/ { found = 1 } END { exit found ? 0 : 1 }' "\${K8S_KUBECONFIG_FILE}"; then
+  echo "deployKubernetes: kubeconfig must embed certificate-authority-data" >&2
+  exit 1
+fi
+if awk -v user="\${K8S_KUBECONFIG_USER}" '\$0 == "- name: " user { found = 1 } END { exit found ? 0 : 1 }' "\${K8S_KUBECONFIG_FILE}"; then
+  echo "deployKubernetes: kubeconfig already contains user '\${K8S_KUBECONFIG_USER}'" >&2
+  exit 1
+fi
+awk 'BEGIN { u = ENVIRON["K8S_KUBECONFIG_USER"]; t = ENVIRON["K8S_TOKEN"] } /^users:/ { seen = 1; print "users:"; printf "- name: %s\\n  user:\\n    token: \\"%s\\"\\n", u, t; next } { print } END { if (!seen) { print "users:"; printf "- name: %s\\n  user:\\n    token: \\"%s\\"\\n", u, t } }' "\${K8S_KUBECONFIG_FILE}" > "\${K8S_KUBECONFIG_FILE}.tmp" && mv "\${K8S_KUBECONFIG_FILE}.tmp" "\${K8S_KUBECONFIG_FILE}"
+chmod 600 "\${K8S_KUBECONFIG_FILE}"
+kubectl config set-context "\${K8S_CONTEXT}" --user "\${K8S_KUBECONFIG_USER}" --namespace "\${K8S_NAMESPACE}" --current
+"""
+                String active = sh(script: 'kubectl config current-context', returnStdout: true).trim()
+                if (active != context) {
+                    error "deployKubernetes: expected kubectl context '${context}', got '${active}'"
+                }
+
+                sh "kubectl --context ${q(context)} --namespace ${q(namespace)} apply --dry-run=server -k ${q(tempDir)}"
+                sh "kubectl --context ${q(context)} --namespace ${q(namespace)} apply -k ${q(tempDir)}"
+                echo "Applied ${environment} manifests from ${tempDir} (no prune)"
+
+                deployments.each { String deployment ->
+                    sh "kubectl --context ${q(context)} --namespace ${q(namespace)} rollout status deployment/${deployment} --timeout=${rolloutTimeout}s"
+                }
+                echo "All ${deployments.size()} deployments rolled out in namespace ${namespace}"
+            }
+        }
+    } catch (Throwable t) {
+        originalFailure = t
+    }
+
+    Throwable cleanupFailure = null
+    try {
+        int cleanupStatus = sh(script: "rm -f ${q(kubeconfigFile)} && rm -rf ${q(tempDir)}", returnStatus: true)
+        if (cleanupStatus != 0) {
+            cleanupFailure = new RuntimeException("exit ${cleanupStatus}")
+        }
+    } catch (Throwable t) {
+        cleanupFailure = t
+    }
+    if (cleanupFailure != null) {
+        echo "deployKubernetes: WARNING cleanup failed for ${tempDir}: ${cleanupFailure.message}"
+        if (originalFailure == null) {
+            originalFailure = new RuntimeException("deployKubernetes: cleanup failed after deploy")
+        }
+    }
+    if (originalFailure != null) {
+        throw originalFailure
     }
 
     return [environment     : environment,

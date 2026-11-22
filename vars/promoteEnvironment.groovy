@@ -12,6 +12,7 @@ def call(Map params = [:]) {
     List<String> deployments = params.deployments ?: []
     List<Map> verifyPaths = params.verifyPaths ?: []
     String kubeconfigCredentialId = params.kubeconfigCredentialId ?: "${to}-kubeconfig"
+    String k8sTokenCredentialId = params.k8sTokenCredentialId ?: "${to}-k8s-token"
     int rolloutTimeout = params.rolloutTimeout ?: 300
     int retries = params.retries ?: 20
     int interval = params.intervalSeconds ?: 10
@@ -74,6 +75,7 @@ def call(Map params = [:]) {
         registry: registry,
         overlayPath: overlayPath,
         kubeconfigCredentialId: kubeconfigCredentialId,
+        k8sTokenCredentialId: k8sTokenCredentialId,
         images: images,
         deployments: deployments,
         rolloutTimeout: rolloutTimeout
