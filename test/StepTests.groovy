@@ -4520,6 +4520,22 @@ test('resolves each context but keeps the single manifest namespace') {
     assert cfg.namespaceFor('prod') == 'circleguard'
 }
 
+test('keeps constructor-called config resolvers native for Jenkins CPS') {
+    String source = new File(root, 'src/org/circleguard/ci/PipelineConfig.groovy').text
+
+    assert source.contains('import com.cloudbees.groovy.cps.NonCPS'):
+            'PipelineConfig must import NonCPS for methods called from its constructor'
+
+    ['contextFor', 'namespaceFor'].each { String method ->
+        String signature = "String ${method}(String environmentName)"
+        int at = source.indexOf(signature)
+        assert at >= 0: "${method} must exist"
+        String preceding = source.substring(Math.max(0, at - 60), at)
+        assert preceding.contains('@NonCPS'):
+                "${method} is called from PipelineConfig.<init> and must be @NonCPS"
+    }
+}
+
 test('rejects namespace configurations that disagree with the manifests') {
     try {
         newConfig([deploy: true, environment: 'dev', k8sContext: 'cg-dev',

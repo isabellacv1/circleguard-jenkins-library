@@ -28,7 +28,7 @@ cleanup traps are verified as real shell behaviour, not only as source text.
 of the steps (commands built, gates, provenance checks, messages and evidence);
 they are **not** a validation of Jenkins, Docker, Terraform or AWS — those real
 validations are listed in the main README (*Known limitations and follow-ups*)
-and are still pending. The suite currently runs **165 tests**.
+and are still pending. The suite currently runs **176 tests**.
 
 ## Why `test/` and not `src/`
 

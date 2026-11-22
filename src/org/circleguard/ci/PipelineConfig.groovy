@@ -1,5 +1,7 @@
 package org.circleguard.ci
 
+import com.cloudbees.groovy.cps.NonCPS
+
 /**
  * Parameters accepted by circleguardPipeline().
  * Every value has a default, so the Jenkinsfile only sets what changes.
@@ -322,11 +324,13 @@ class PipelineConfig implements Serializable {
         }
     }
 
+    @NonCPS
     String contextFor(String environmentName) {
         String configured = this.k8sContexts[environmentName] ?: this.k8sContext
         return configured?.trim() ?: ''
     }
 
+    @NonCPS
     String namespaceFor(String environmentName) {
         String configured = this.k8sNamespaces[environmentName] ?: this.k8sNamespace
         return configured?.trim() ?: ''
