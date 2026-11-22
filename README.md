@@ -19,6 +19,10 @@ vars/resolveVersion.groovy                     semantic version for the images (
 vars/publishImages.groovy                      docker build + push to the Nexus registry
 vars/ensureBuildx.groovy                       installs the Docker buildx plugin if missing (BuildKit)
 vars/notifyDiscord.groovy                      Discord notification of the build result
+vars/deployKubernetes.groovy                   app-only Kustomize render + scope validation + kubectl apply/rollout
+vars/verifyIngress.groovy                      HTTP verification of Ingress paths
+vars/smokeTests.groovy                         functional HTTP checks from the Jenkins agent
+vars/promoteEnvironment.groovy                 Kubernetes promotion with approval and evidence
 ```
 
 ## Usage
@@ -50,18 +54,27 @@ circleguardPipeline(
 | `publishBranches` | `['dev', 'main']` | Branches that publish images (PRs never publish). |
 | `registry` | `localhost:8082` | Docker registry (Nexus `docker-hosted` HTTP connector). |
 | `registryCredentialsId` | `nexus-credential` | Jenkins credential with push access to the registry. |
-| `images` | 5 core services + web | List of `[name, dockerfile, context]` to build. |
+| `images` | nine CircleGuard images | List of `[name, dockerfile, context]` to build. The default covers all nine Deployments. |
 | `publishTimeout` | `40` | Publish stage timeout (minutes). |
 | `discordCredentialsId` | `discord-webhook-url` | Jenkins Secret text credential with the Discord webhook URL. Empty disables it. |
-| `deploy` | `false` | Deploys the published images to an AWS environment (requires `publish: true`). |
-| `environment` | `dev` | Target environment: `dev`, `stage` or `prod`. Read from `deploy/environments/<env>.env`. |
+| `deploy` | `false` | Deploys the published images to Kubernetes with Kustomize (requires `publish: true`). |
+| `environment` | `dev` | Target environment: `dev`, `stage` or `prod`. |
 | `deployBranches` | `['dev']` | Branches that run the deploy and verification stages. |
-| `deployCredentialId` | `${environment}-credential` | SSH credential (`dev-credential`, `stage-credential`, `prod-credential`). |
+| `kubeconfigCredentialId` | `${environment}-kubeconfig` | Jenkins Secret file credential with the kubeconfig. Promotions pass the same override; when unset they derive `${to}-kubeconfig`. |
+| `k8sContext` | required when `deploy` | Default kubectl context. Used explicitly by every command that interacts with the cluster. |
+| `k8sNamespace` | `circleguard` | Fixed application namespace; any other value is rejected because the manifests hardcode `metadata.namespace: circleguard`. |
+| `k8sContexts` | `[:]` | Per-environment context map (`dev`, `stage`, `prod`); overrides `k8sContext`. |
+| `k8sNamespaces` | `[:]` | Per-environment namespace map; only `circleguard` is accepted so apply and rollout always target the namespace declared in the manifests. |
+| `k8sRegistry` | `10.20.1.230:8082` | Registry prefix used to rewrite the overlay images. Independent from `registry`. |
+| `k8sOverlayPaths` | `[:]` | Map from environment to the **application** overlay path; defaults to `infra/k8s/overlays/<env>`. Platform resources live in `infra/k8s/platform/overlays/<env>` and are not applied by Jenkins. |
+| `k8sIngressUrls` | `[:]` | Map from environment to Ingress base URL. Required up front for `environment` and, when `promote`, for `stage` and `prod`. |
+| `k8sDeployments` | nine CircleGuard Deployments | Names waited with `kubectl rollout status`. |
+| `k8sVerifyPaths` | six Ingress endpoints | Paths and expected HTTP codes checked after every deploy/promotion. |
 | `deployTimeout` | `20` | Deploy stage timeout (minutes). |
 | `verifyTimeout` | `15` | Verification stage timeout (minutes). |
-| `healthRetries` | `20` | Attempts per service before the deployment is rejected. |
-| `healthIntervalSeconds` | `10` | Seconds between attempts. |
-| `services` | gateway/auth/identity/form/promotion/web | Components checked after the deployment (`name`, `port`, `path`). |
+| `verifyRetries` | `20` | Attempts per Ingress endpoint before the deployment is rejected. |
+| `verifyIntervalSeconds` | `10` | Seconds between attempts. |
+| `k8sRolloutTimeout` | `300` | Seconds given to every `kubectl rollout status`. |
 | `e2e` | `true` | Runs the Playwright end to end tests against the deployed `dev`. |
 | `e2eTimeout` | `20` | E2E stage timeout (minutes). |
 | `e2eCredentialsId` | `e2e-credential` | Username/password of a test user of the application. |
@@ -97,7 +110,7 @@ circleguardPipeline(
 | `terraformApplyRoot` | `infra/terraform/envs/dev` | Single root applied. Independent from `terraformPlanRoot`, so enabling another environment is always an explicit decision. |
 | `terraformApplyBranches` | `['dev']` | Branches that apply. **PRs and every other branch are excluded** (the stage requires the flag AND the branch). |
 | `terraformApplyTimeout` | `30` | Apply command timeout; the stage budget is `2 ×` this value (init + apply). |
-| `terraformApproval` | `false` | Master switch of the manual approval that will gate an environment apply. **S1: configuration only — the approval step does not exist yet.** |
+| `terraformApproval` | `false` | Master switch of the manual approval between the PROD plan and the PROD apply. The step is wired but inert until `terraformApprovalProd` and `terraformApplyProd` are enabled. |
 | `terraformApprovalTimeout` | `30` | Minutes the approver has to answer (must be `> 0`, otherwise the configuration is rejected). |
 | `terraformApprovalSubmitter` | `admin` | Users/groups allowed to approve (passed to `submitter` of `input`). Must not be empty, otherwise the configuration is rejected. |
 | `terraformApprovalMaxAgeMinutes` | `60` | A plan older than this is rejected instead of applied (must be `> 0`). |
@@ -106,13 +119,27 @@ circleguardPipeline(
 | `terraformApplyProd` | `false` | PROD apply switch: **off**. Independent from `terraformApprovalProd`. |
 | `terraformApprovalProd` | `false` | PROD approval switch: **off**. Both PROD switches must be enabled explicitly. |
 
-**Application secrets.** The deploy and promotion stages also need the Jenkins
-**Secret file** credential `<environment>-app-secrets` (`dev-app-secrets`,
-`stage-app-secrets`, `prod-app-secrets`): a `KEY=VALUE` file following
-`deploy/secrets/secrets.env.example` of the application. `deployEnvironment`
-appends it to the `.env` copied to the host (`600`), without printing it; its
-`secretsCredentialId` parameter overrides the id. It is mandatory: the compose
-files reject a missing secret, so a deploy without the credential fails.
+**Kubernetes credentials.** The deploy and promotion stages need the Jenkins
+**Secret file** credential `<environment>-kubeconfig` (`dev-kubeconfig`,
+`stage-kubeconfig`, `prod-kubeconfig`). It is bound with `withCredentials` only
+around the kubectl commands. `kubectl kustomize` is a **local render** of the
+copied **application** overlay and deliberately has no `--context`/`--namespace`;
+every command that interacts with the cluster passes both flags explicitly. The
+rendered output is validated **before archiving and before the server dry-run or
+apply**: it must not be empty, every resource must have `metadata.namespace:
+circleguard`, and the only allowed kinds are `ConfigMap`, `Deployment`, `Service`,
+`Ingress` and `PersistentVolumeClaim`. Namespaces, RBAC, quotas, NetworkPolicies
+and observability belong to `infra/k8s/platform/overlays/<env>` and are applied
+by infrastructure, not by this library. The active context is checked after the
+local render but **before** the server dry-run and apply, so no cluster mutation
+can happen under the wrong context. The application Secrets and the registry pull
+Secret are expected to already exist in the target namespace; the library does
+not create, modify or print them. Contexts can be set per environment with
+`k8sContexts`; namespaces cannot: every application manifest hardcodes
+`metadata.namespace: circleguard`, so `k8sNamespace`/`k8sNamespaces` selecting
+anything else is rejected before any stage runs. `kubeconfigCredentialId`
+overrides the id in `circleguardPipeline` and is also passed to promotions, while
+the default for promotions is `${to}-kubeconfig`.
 
 ### Stages
 
@@ -131,12 +158,12 @@ files reject a missing secret, so a deploy without the credential fails.
 | Terraform apply DEV | `terraform init -backend=true` + `terraform apply -lock=true ci-<env>-b<build>.tfplan`, the plan of **this** build only, **never an approval** (stage `Terraform apply`, if `terraformApply` and branch in `terraformApplyBranches`) |
 | Terraform apply PROD | `terraform apply -lock=true` for the PROD root, only with a valid approval of **this** build (`requireApproval: true`; stage `Terraform apply PROD`) |
 | Publish images | `docker build` + `docker push` of every image (if `publish` and branch in `publishBranches`); each image is scanned with Trivy **between the build and the push** when `trivyImageScan` is enabled |
-| Deploy | Copies the compose files to the target host over SSH and runs `docker compose up -d --wait` with the published images (if `deploy` and branch in `deployBranches`) |
-| Verify deployment | HTTP check of every component with retries; the build fails if a service does not answer (if `deploy`) |
-| Smoke tests | Functional HTTP checks against the target host, with a JUnit report (if `deploy` and `smokeTests`) |
-| E2E tests | Playwright tests in a container against the deployed `dev` (condition to promote, if `e2e`) |
+| Deploy | Renders a temporary **application** overlay with the nine images pinned to `env.IMAGE_VERSION`, rejects any render outside the `circleguard` app scope before archiving, applies it with `kubectl --context ... --namespace ... apply -k` (no prune), checks all rollouts and archives the validated manifest (if `deploy` and branch in `deployBranches`) |
+| Verify deployment | HTTP checks of the six Ingress paths with retries; a `404` always fails the build (if `deploy`) |
+| Smoke tests | Functional HTTP checks against the Ingress base URL, with a JUnit report (if `deploy` and `smokeTests`) |
+| E2E tests | Playwright tests in a container against the same Ingress base URL used by verification; `results.xml`, `playwright-report/` and `test-results/` are cleaned before the run, a failed cleanup stops the stage **before** Playwright, JUnit and archiving, and a missing or empty new `results.xml` fails the stage (condition to promote, if `e2e`) |
 | Promote to stage | Deploys the **same version** to `stage` and verifies it; manual `input` only if `stageApproval` |
-| Promote to prod | Deploys the **same version** to `prod`, verifies it and archives `promotion-record.txt`; always behind a manual `input` |
+| Promote to prod | Deploys the **same version** to `prod`, verifies it and archives `promotion-record.txt`; always behind a manual `input` that must identify the approver (a `null`/empty answer stops the promotion) |
 
 ## Static validation of the infrastructure as code (Terraform + Trivy)
 
@@ -180,11 +207,10 @@ that root. Two guards run before the mount: the workspace must live under
 
 > ⚠ **`volume-subpath` still needs a real `docker run` to be validated.** It is
 > documented by the Docker Engine and supported by the Docker 29.9.3 of the
-> host, but no container has been executed yet in this environment. If the mount
-> fails, the documented fallback is the previous behaviour: mount the whole
-> volume (`-v circleguard-jenkins-home:/jh`) and translate `/var/jenkins_home/...`
-> to `/jh/...` — used only as an emergency fallback: since the `runE2E` change,
-> **no step mounts the whole volume anymore**.
+> host, but no container has been executed yet in this environment. Both
+> `runInContainer` and `runE2E` use only `--mount ... volume-subpath`; there is
+> no `-v circleguard-jenkins-home:/jh` fallback and no step mounts the whole
+> Jenkins volume.
 
 Rules enforced by the steps:
 
@@ -308,7 +334,7 @@ circleguardPipeline(
 
 | Step | Image (pinned) | Commands |
 |------|----------------|----------|
-| `terraformPlan` | `hashicorp/terraform:1.17.2` | `terraform init -backend=true -no-color -input=false` · `terraform plan -no-color -input=false -lock=true -detailed-exitcode -out=ci-<env>.tfplan` (workdir = the root) |
+| `terraformPlan` | `hashicorp/terraform:1.17.2` | `terraform init -backend=true -no-color -input=false` · `terraform plan -no-color -input=false -lock=true -detailed-exitcode -out=ci-<env>-b<build>.tfplan` (workdir = the root) |
 
 ### Gating
 
@@ -632,6 +658,7 @@ Operational implications:
   any credential**. Those settings have no effect while the PROD switches stay
   off.
 - `GIT_COMMIT` is **required**: without it the provenance check fails closed.
+- **Kubernetes platform is applied separately**: Jenkins renders, validates and applies only `infra/k8s/overlays/<env>` (namespaced application resources in `circleguard`). Namespaces, RBAC, quotas, NetworkPolicies and observability must be applied from `infra/k8s/platform/overlays/<env>` with an administrative identity; the data root is also independent. Real kubeconfig credentials, context names and Ingress URLs still have to be supplied by the consumer `Jenkinsfile`.
 - Plans of previous builds (`ci-<env>-b<*>.tfplan`) remain in the `dev`/`main`
   workspaces; they can never be applied (the name carries another build number)
   and could be cleaned up in a later phase.
@@ -669,19 +696,31 @@ globalLibraries:
 After `Verify deployment`, the `Smoke tests` stage runs `smokeTests()` against the deployed environment.
 The same checks run after every promotion (stage, prod).
 
+All requests use the Ingress base URL from `k8sIngressUrls[environment]`. The port
+is part of the configured base URL (or omitted behind a real Ingress).
+
+`verifyIngress` accepts `checks[].expected` as a string (`'401 403'`) or a list
+(`[401, 403]`), and an optional `expectedCodes` map keyed by check name. It
+separates curl transport failures (`CURL_EXIT != 0`) from HTTP status codes, so
+a network error is reported as `curl exit N` instead of being treated as a bad
+HTTP answer. The generated shell explicitly disables `set -e` around curl, so the
+exit code is always captured and the retry loop keeps working under Jenkins'
+default `sh -xe`. A `404` is still rejected even when explicitly expected.
+
 | Check | Request | Expected |
 |-------|---------|----------|
-| web home page | `GET :8081/` | 200 and HTML |
-| web runtime configuration | `GET :8081/env-config.js` | 200 and `__ENV__` |
-| gateway validates a token | `POST :8087/api/v1/gate/validate` | 200 and a validation result |
-| form lists pending surveys | `GET :8086/api/v1/certificates/pending` | 200 |
-| promotion health stats | `GET :8088/api/v1/health-status/stats` | 200 and JSON |
-| identity requires auth | `GET :8083/api/v1/identities/lookup/<id>` without token | 401 or 403 |
-| auth login with valid user | `POST :8180/api/v1/auth/login` (credential `e2e-credential`) | 200 and a token |
-| auth rejects a wrong password | `POST :8180/api/v1/auth/login` | 401 |
+| web home page | `GET /` | 200 and HTML |
+| web runtime configuration | `GET /env-config.js` | 200 and `__ENV__` |
+| gateway validates a token | `POST /api/v1/gate/validate` | 200 and a validation result |
+| form lists pending surveys | `GET /api/v1/certificates/pending` | 200 |
+| promotion health stats | `GET /api/v1/health-status/stats` | 200 and JSON |
+| identity requires auth | `GET /api/v1/identities/lookup/00000000-0000-0000-0000-000000000000` without token | 401 or 403 |
+| auth login with valid user | `POST /api/v1/auth/login` (credential `e2e-credential`) | 200 and a token |
+| auth rejects a wrong password | `POST /api/v1/auth/login` | 401 |
 
-- Every check expects a specific status (and body fragment), unlike `verifyServices`, which accepts any answer below 500.
-- The checks run on the target host over SSH against `localhost`, so the application ports do not need to be open to Jenkins.
+- Every check expects a specific status (and body fragment); a `404` never counts as success.
+- The checks run from the Jenkins agent over HTTP, so no SSH access or NodePort access is needed.
+- Shell tracing is disabled (`set +x`) before any credential is used. The generated `smoke-run.sh`, the login files and `body.tmp` are created with restrictive permissions (`chmod 600`; credentials also with `umask 077`), and are removed by an `EXIT`/signal trap for `body.tmp` and by a verified `finally` cleanup; a cleanup failure fails the build only when no earlier error exists, so it never masks the original failure.
 - Results: JUnit report `smoke-tests/smoke-<env>.xml` (Tests tab) and `smoke-tests/smoke-<env>.txt` (artifact).
 - If a check fails, the build fails and its description says `smoke tests FAILED on <env>`.
 
@@ -690,6 +729,14 @@ The same checks run after every promotion (stage, prod).
 | `smokeTests` | `true` | Runs the smoke tests after the deployment and after each promotion. |
 | `smokeCredentialsId` | `e2e-credential` | Username/password credential for the login check (`null` skips the login checks). |
 | `smokeTimeout` | `10` | Smoke tests stage timeout (minutes). |
+
+### Kubernetes integration blocker (next stage)
+
+The application `Jenkinsfile` was intentionally **not modified** in this round. It
+still enables `deploy: true` and `promote: true` without defining `k8sContext`,
+`k8sContexts` or `k8sIngressUrls`, so `PipelineConfig` rejects the configuration
+before the `Build` stage. This is a known integration blocker to resolve in the
+next stage; the library tests now reproduce it explicitly.
 
 ## Disk cleanup on the Jenkins host
 
