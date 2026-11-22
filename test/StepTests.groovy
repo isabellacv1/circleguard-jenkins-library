@@ -31,6 +31,21 @@ String ENOUGH_DF = '''Filesystem 1024-blocks    Used Available Capacity Mounted 
 String LOW_DF = '''Filesystem 1024-blocks    Used Available Capacity Mounted on
 /dev/root        28000000 27900000    100000      97% /'''
 
+String VALID_K8S_MANIFEST = '''apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: circleguard-common-config
+  namespace: circleguard
+data:
+  APP_ENV: dev
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: circleguard-web
+  namespace: circleguard
+'''
+
 int passed = 0
 List<String> failures = []
 
@@ -47,6 +62,7 @@ def test = { String name, Closure body ->
 }
 
 GroovyClassLoader loader = new GroovyClassLoader(this.class.classLoader)
+loader.parseClass('package com.cloudbees.groovy.cps; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) @Target([ElementType.METHOD]) public @interface NonCPS {}')
 
 // Parsed once: terraformPlan reuses the free-space parser of terraformValidate
 // (terraformValidate.freeSpaceMB), so the real step must be bindable.
@@ -91,6 +107,31 @@ def tokenizeShell = { String s ->
     tokens
 }
 
+def newTempDir = { String prefix ->
+    return java.nio.file.Files.createTempDirectory(new File('/tmp/opencode').toPath(), prefix).toFile()
+}
+
+def writeTestFile = { File file, String text ->
+    file.parentFile?.mkdirs()
+    file.text = text
+    return file
+}
+
+def runShell = { String scriptText, File cwd, Map envVars = [:], String prependPath = null ->
+    ProcessBuilder pb = new ProcessBuilder('bash', '-c', scriptText)
+    pb.directory(cwd)
+    pb.redirectErrorStream(true)
+    Map processEnv = pb.environment()
+    if (prependPath) {
+        processEnv.PATH = prependPath + File.pathSeparator + (processEnv.PATH ?: '/usr/bin:/bin')
+    }
+    envVars.each { String key, Object value -> processEnv[key] = value.toString() }
+    Process process = pb.start()
+    String stdout = process.inputStream.getText('UTF-8')
+    int exit = process.waitFor()
+    return [stdout: stdout, exit: exit]
+}
+
 /**
  * Instantiates a step with a stubbed Jenkins environment.
  *
@@ -105,6 +146,7 @@ def tokenizeShell = { String s ->
  * opts.missing              paths for which fileExists() answers false
  * opts.files                contents returned by readFile()
  * opts.dfOutput             stdout of the `df` call (free-space check)
+ * opts.renderedManifest     stdout of `kubectl kustomize` (defaults to a valid app render)
  * opts.failSh               when true, every sh throws (checks the `finally` evidence)
  * opts.failShMessage        message used by failSh / failShContains (e.g. AccessDenied)
  * opts.failShContains       every sh whose text contains this value throws
@@ -128,16 +170,37 @@ def newStep = { String name, Map opts = [:] ->
         withCredentials: [],
         junit   : [],
         inputs  : [],        // maps passed to the stubbed input step
+        currentBuild: [description: ''],
+        shellOutputs: [],
+        shellCodes: [],
         trace   : []     // ordered: sh commands + stubbed sibling steps (order assertions)
     ]
     def binding = new Binding()
     binding.setVariable('env', b.env)
+    binding.setVariable('currentBuild', b.currentBuild)
     binding.setVariable('echo', { Object m -> b.logs << m.toString() })
     binding.setVariable('error', { Object m -> throw new RuntimeException(m.toString()) })
     binding.setVariable('sh', { Object arg ->
         String scriptText = (arg instanceof Map) ? arg.script.toString() : arg.toString()
         b.sh << scriptText
         b.trace << scriptText
+        List<String> realPatterns = (opts.realShContains instanceof List) ?
+                opts.realShContains.collect { it.toString() } :
+                (opts.realShContains ? [opts.realShContains.toString()] : [])
+        if (realPatterns.any { scriptText.contains(it) }) {
+            File cwd = (opts.realShCwd ?: new File('/tmp/opencode')) as File
+            def result = runShell(scriptText, cwd, (opts.realShEnv ?: [:]) as Map,
+                                  opts.realShPath as String)
+            b.shellOutputs << result.stdout
+            b.shellCodes << result.exit
+            if (arg instanceof Map && arg.returnStdout) {
+                return result.stdout
+            }
+            if (result.exit != 0) {
+                throw new RuntimeException("shell failed (${result.exit}): ${result.stdout.trim()}")
+            }
+            return result.exit
+        }
         // opts.failSh makes every command fail: used to check the `finally`
         // blocks that must publish their evidence even when the step blows up.
         // opts.failShMessage changes the message of that failure (e.g. to simulate
@@ -150,6 +213,11 @@ def newStep = { String name, Map opts = [:] ->
         if (opts.failShContains && scriptText.contains(opts.failShContains)) {
             throw new RuntimeException(opts.failShMessage ?: 'simulated command failure')
         }
+        (opts.failShContainsList ?: []).each { Map failure ->
+            if (scriptText.contains(failure.contains)) {
+                throw new RuntimeException(failure.message ?: 'simulated command failure')
+            }
+        }
         if (arg instanceof Map) {
             if (arg.returnStatus) {
                 return (opts.status ?: 0) as int
@@ -157,6 +225,9 @@ def newStep = { String name, Map opts = [:] ->
             if (arg.returnStdout) {
                 if (scriptText.startsWith('df ')) {
                     return (opts.dfOutput ?: ENOUGH_DF)
+                }
+                if (scriptText.contains('kubectl kustomize')) {
+                    return (opts.renderedManifest ?: VALID_K8S_MANIFEST)
                 }
                 return (opts.stdout ?: '')
             }
@@ -173,6 +244,7 @@ def newStep = { String name, Map opts = [:] ->
     // like the real step; usernamePassword() returns its arguments, so a test can
     // assert the credential id and the variable names WITHOUT reading any secret.
     binding.setVariable('usernamePassword', { Object args -> args })
+    binding.setVariable('file', { Object args -> args })
     binding.setVariable('withCredentials', { Object bindings, Closure body ->
         b.withCredentials << bindings
         return body.call()
@@ -237,10 +309,23 @@ def newStep = { String name, Map opts = [:] ->
             throw new RuntimeException('simulated image scan failure')
         }
     })
+    binding.setVariable('deployKubernetes', { Map p ->
+        b.trace << "deployKubernetes(${p.environment})"
+        [manifestArtifact: "k8s/rendered-${p.environment}-${b.env.BUILD_NUMBER ?: 'local'}.yaml"]
+    })
+    binding.setVariable('verifyIngress', { Map p ->
+        b.trace << "verifyIngress(${p.baseUrl})"
+        []
+    })
+    binding.setVariable('smokeTests', { Map p ->
+        b.trace << "smokeTests(${p.baseUrl})"
+        []
+    })
 
     [script: script, sh: b.sh, logs: b.logs, archived: b.archived, written: b.written,
      env: b.env, withEnv: b.withEnv, withCredentials: b.withCredentials, junit: b.junit,
-     inputs: b.inputs, trace: b.trace]
+     inputs: b.inputs, trace: b.trace, currentBuild: b.currentBuild,
+     shellOutputs: b.shellOutputs, shellCodes: b.shellCodes]
 }
 
 println 'runInContainer'
@@ -2699,6 +2784,10 @@ test('still compiles with the new stages') {
     child.parseClass(new File(root, 'vars/terraformApply.groovy'))
     child.parseClass(new File(root, 'vars/trivyScan.groovy'))
     child.parseClass(new File(root, 'vars/runInContainer.groovy'))
+    child.parseClass(new File(root, 'vars/deployKubernetes.groovy'))
+    child.parseClass(new File(root, 'vars/verifyIngress.groovy'))
+    child.parseClass(new File(root, 'vars/smokeTests.groovy'))
+    child.parseClass(new File(root, 'vars/promoteEnvironment.groovy'))
 }
 
 test('declares the new stages before Publish images and gates them by config') {
@@ -3169,10 +3258,11 @@ test('mounts only the job workspace with volume-subpath and keeps the reports') 
     def h = newStep('runE2E')
     h.script.call(baseUrl: 'http://44.212.47.173:8081')
 
-    // only one command: the docker run (no df, no mkdir, no rm)
-    assert h.sh.size() == 1: "expected 1 command, got ${h.sh.size()}"
-    String cmd = h.sh[0]
-    assert cmd.contains('docker run --rm')
+    assert h.sh.size() == 2: "expected E2E evidence cleanup and docker run, got ${h.sh.size()}"
+    assert h.sh[0] == "rm -f 'tests/e2e-playwright/results.xml' && " +
+                      "rm -rf 'tests/e2e-playwright/playwright-report' 'tests/e2e-playwright/test-results'": h.sh[0]
+    String cmd = h.sh.find { it.contains('docker run --rm') }
+    assert cmd != null: h.sh
 
     // H1: ONLY the workspace of the job is mounted, with the same pattern as
     // runInContainer; the whole volume and any host path stay out of the container
@@ -3224,17 +3314,107 @@ test('mounts only the job workspace with volume-subpath and keeps the reports') 
 }
 
 test('publishes the reports even when the container fails') {
-    def h = newStep('runE2E', [failSh: true])
+    def h = newStep('runE2E', [failShContainsList: [[contains: 'docker run',
+                                                     message: 'simulated container failure']]])
     try {
         h.script.call(baseUrl: 'http://44.212.47.173:8081')
         assert false: 'a failing container must fail the step'
     } catch (RuntimeException e) {
-        assert e.message.contains('simulated command failure'): e.message
+        assert e.message.contains('simulated container failure'): e.message
     }
-    // the `finally` block ran before the failure propagated
+    // reports are still collected before the original failure is rethrown
     assert h.junit == ['tests/e2e-playwright/results.xml']: h.junit
     assert h.archived.contains('tests/e2e-playwright/playwright-report/**, ' +
                                'tests/e2e-playwright/test-results/**'): h.archived
+}
+
+test('fails when Playwright produces no results.xml or an empty one') {
+    String results = 'tests/e2e-playwright/results.xml'
+    def missing = newStep('runE2E', [missing: [results]])
+    try {
+        missing.script.call(baseUrl: 'http://ingress.example')
+        assert false: 'a missing results.xml must fail the step'
+    } catch (RuntimeException e) {
+        assert e.message.contains('missing tests/e2e-playwright/results.xml'): e.message
+    }
+    assert missing.junit.isEmpty()
+
+    def empty = newStep('runE2E', [files: [(results): '   ']])
+    try {
+        empty.script.call(baseUrl: 'http://ingress.example')
+        assert false: 'an empty results.xml must fail the step'
+    } catch (RuntimeException e) {
+        assert e.message.contains('empty tests/e2e-playwright/results.xml'): e.message
+    }
+    assert empty.junit.isEmpty()
+}
+
+test('preserves the original E2E failure when report publishing also fails') {
+    def h = newStep('runE2E', [failShContainsList: [[contains: 'docker run',
+                                                     message: 'simulated container failure']],
+                               missing: ['tests/e2e-playwright/results.xml']])
+    try {
+        h.script.call(baseUrl: 'http://ingress.example')
+        assert false: 'the original failure must propagate'
+    } catch (RuntimeException e) {
+        assert e.message.contains('simulated container failure'): e.message
+        assert !e.message.contains('missing tests/e2e-playwright/results.xml'): e.message
+    }
+    assert h.logs.any { it.toString().contains('report publication also failed') }
+}
+
+test('escapes quotes in the E2E base URLs') {
+    String tricky = "http://ingress.example/a'b"
+    String escaped = tricky.replace("'", "'\\''")
+    def h = newStep('runE2E')
+    h.script.call(baseUrl: tricky, authBaseUrl: tricky, gatewayBaseUrl: tricky)
+    String cmd = h.sh.find { it.contains('docker run') }
+    assert cmd.contains("-e BASE_URL='${escaped}'")
+    assert cmd.contains("-e AUTH_BASE_URL='${escaped}'")
+    assert cmd.contains("-e GATEWAY_BASE_URL='${escaped}'")
+}
+
+test('deletes previous E2E evidence before Playwright and never publishes it') {
+    String results = 'tests/e2e-playwright/results.xml'
+    String report = 'tests/e2e-playwright/playwright-report/index.html'
+    String artifacts = 'tests/e2e-playwright/test-results/failure.txt'
+    File dir = newTempDir('e2e-stale-')
+    File old = writeTestFile(new File(dir, results), '<testsuite name="old-build"/>')
+    File oldReport = writeTestFile(new File(dir, report), 'old html report')
+    File oldArtifacts = writeTestFile(new File(dir, artifacts), 'old failure context')
+
+    def h = newStep('runE2E', [missing: [results]])
+    try {
+        h.script.call(baseUrl: 'http://ingress.example')
+        assert false: 'a run with no new results must fail'
+    } catch (RuntimeException e) {
+        assert e.message.contains('missing tests/e2e-playwright/results.xml'): e.message
+    }
+
+    String cleanup = "rm -f 'tests/e2e-playwright/results.xml' && " +
+                     "rm -rf 'tests/e2e-playwright/playwright-report' 'tests/e2e-playwright/test-results'"
+    assert h.sh[0] == cleanup: h.sh[0]
+    int dockerIndex = h.sh.findIndexOf { it.contains('docker run') }
+    assert dockerIndex > 0: 'Playwright must run after the E2E evidence cleanup'
+    assert runShell(h.sh[0], dir).exit == 0
+    assert !old.exists(): 'the stale results.xml must be gone before the next run'
+    assert !oldReport.exists(): 'the stale HTML report must be gone before the next run'
+    assert !oldArtifacts.exists(): 'the stale test-results must be gone before the next run'
+    assert h.junit.isEmpty(): 'stale JUnit evidence must never be published'
+
+    def cleanupFailure = newStep('runE2E', [failShContainsList: [
+        [contains: 'rm -f', message: 'CLEANUP ERROR']]])
+    try {
+        cleanupFailure.script.call(baseUrl: 'http://ingress.example')
+        assert false: 'a failed E2E evidence cleanup must fail the step'
+    } catch (RuntimeException e) {
+        assert e.message.contains('could not clean previous E2E evidence'): e.message
+        assert e.message.contains('CLEANUP ERROR'): e.message
+    }
+    assert cleanupFailure.sh.size() == 1: 'Playwright must not run after a failed cleanup'
+    assert cleanupFailure.withCredentials.isEmpty(): 'no credential may be bound after a failed cleanup'
+    assert cleanupFailure.junit.isEmpty(): 'stale evidence must never be published'
+    assert cleanupFailure.archived.isEmpty(): 'stale evidence must never be archived'
 }
 
 test('refuses a workspace outside /var/jenkins_home/workspace before running') {
@@ -3277,6 +3457,741 @@ test('no step mounts the whole Jenkins volume anymore (source level)') {
     assert e2e.contains('volume-subpath'): 'runE2E must use volume-subpath'
     assert e2e.contains('fileExists(env.WORKSPACE)'): 'runE2E must guard the mount'
     assert !e2e.contains('hostWorkspace'): 'the whole-volume path translation is gone'
+}
+
+println 'Kubernetes deployment'
+
+test('deploys the build version with an explicit context and no prune') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = ['web', 'auth-service', 'identity-service', 'promotion-service',
+                  'notification-service', 'form-service', 'gateway-service',
+                  'dashboard-service', 'file-service'].collect { [name: "circleguard/${it}"] }
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                        stdout: 'cg-dev'])
+
+    h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                  registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                  images: images, deployments: names, rolloutTimeout: 120)
+
+    assert h.sh.count { it.contains('kustomize edit set image') } == 9
+    images.each { Map image ->
+        String mapping = "'10.20.1.230:8082/${image.name}=10.20.1.230:8082/${image.name}:1.0.0-dev.15'"
+        assert h.sh.any { it.contains(mapping) }: "missing ${mapping}"
+    }
+    assert h.sh.any { it.contains("kubectl --context 'cg-dev' --namespace 'circleguard' apply --dry-run=server -k") }
+    assert h.sh.any { it.contains("kubectl --context 'cg-dev' --namespace 'circleguard' apply -k") }
+    assert h.sh.every { !it.contains('--prune') }
+    assert h.sh.count { it.contains('rollout status deployment/') } == 9
+    assert h.sh.every { !it.contains('rollout status deployment/') || it.contains('--timeout=120s') }
+    assert h.sh.any { it.contains("rm -rf 'infra/k8s/overlays/.deploy-dev-42'") }
+    assert h.archived.contains('k8s/rendered-dev-42.yaml')
+    assert h.withCredentials[0][0].credentialsId == 'dev-kubeconfig'
+    assert h.sh.any { it.contains('kustomize renders local files only') } ||
+           new File(root, 'vars/deployKubernetes.groovy').text.contains('renders local files only')
+}
+
+test('apply and rollout use the manifest namespace and overrides are rejected') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                         stdout: 'cg-dev'])
+
+    h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                  registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                  images: images, deployments: names)
+
+    String apply = h.sh.find { it.contains(' apply -k ') }
+    String rollout = h.sh.find { it.contains('rollout status deployment/') }
+    assert apply.contains("--namespace 'circleguard'"): apply
+    assert rollout.contains("--namespace 'circleguard'"): rollout
+    assert apply.contains("--context 'cg-dev'"): apply
+    assert rollout.contains("--context 'cg-dev'"): rollout
+
+    def bad = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                           stdout: 'cg-dev'])
+    try {
+        bad.script.call(environment: 'stage', context: 'cg-stage', namespace: 'circleguard-stage',
+                        registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/stage',
+                        images: images, deployments: names)
+        assert false: 'a namespace override must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains("manifests hardcode namespace 'circleguard'"): e.message
+        assert e.message.contains("'circleguard-stage' is not supported"): e.message
+    }
+    assert bad.sh.isEmpty(): 'nothing must run with an unsupported namespace'
+}
+
+test('rejects platform resources before archiving or touching the cluster') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    String platformManifest = '''apiVersion: v1
+kind: Namespace
+metadata:
+  name: circleguard-observability
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prometheus
+  namespace: circleguard-observability
+'''
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                        stdout: 'cg-dev', renderedManifest: platformManifest])
+    try {
+        h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                      images: images, deployments: names)
+        assert false: 'platform resources must not be applied by Jenkins'
+    } catch (RuntimeException e) {
+        assert e.message.contains('outside the Jenkins application allowlist'): e.message
+        assert e.message.contains("namespace 'circleguard-observability' is outside 'circleguard'"): e.message
+    }
+    assert h.archived.isEmpty(): 'no out-of-scope manifest should be archived'
+    assert h.sh.every { !it.contains('apply --dry-run=server -k') }
+    assert h.sh.every { !it.contains(' apply -k ') }
+    assert h.sh.every { !it.contains('rollout status deployment/') }
+    assert h.sh.any { it.contains("rm -rf 'infra/k8s/overlays/.deploy-dev-42'") }
+}
+
+test('rejects rendered resources outside the circleguard namespace') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    String badNamespaceManifest = '''apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: circleguard-ingress
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: circleguard-data
+'''
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                        stdout: 'cg-dev', renderedManifest: badNamespaceManifest])
+    try {
+        h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                      images: images, deployments: names)
+        assert false: 'non-application namespaces must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('metadata.namespace is missing'): e.message
+        assert e.message.contains("namespace 'circleguard-data' is outside 'circleguard'"): e.message
+    }
+    assert h.archived.isEmpty()
+    assert h.sh.every { !it.contains(' apply -k ') }
+}
+
+test('rejects an empty render') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                        stdout: 'cg-dev', renderedManifest: '   \n'])
+    try {
+        h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                      images: images, deployments: names)
+        assert false: 'an empty render must never be applied'
+    } catch (RuntimeException e) {
+        assert e.message.contains('is empty; refusing to apply an empty manifest'): e.message
+    }
+    assert h.archived.isEmpty()
+    assert h.sh.every { !it.contains(' apply -k ') }
+}
+
+test('validates the rendered application scope in source') {
+    String text = new File(root, 'vars/deployKubernetes.groovy').text
+    assert text.indexOf('validateRenderedManifest(renderedManifest') > 0
+    assert text.indexOf('validateRenderedManifest(renderedManifest') < text.indexOf('archiveArtifacts')
+    assert text.contains("'ConfigMap', 'Deployment', 'Service', 'Ingress', 'PersistentVolumeClaim'")
+    assert !text.contains('--prune')
+}
+
+test('cleans the temporary overlay when rendering fails') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                        stdout: 'cg-dev', failShContains: 'kubectl kustomize'])
+    try {
+        h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                      images: images, deployments: names)
+        assert false: 'a rendering failure must fail the deploy'
+    } catch (RuntimeException e) {
+        assert e.message.contains('simulated command failure'): e.message
+    }
+    assert h.sh.any { it.contains("rm -rf 'infra/k8s/overlays/.deploy-dev-42'") }
+    assert h.archived.isEmpty(): 'no manifest should be archived when rendering failed'
+}
+
+test('cleans the temporary overlay when apply or rollout fails') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    ['apply -k', 'rollout status'].each { String broken ->
+        def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                            stdout: 'cg-dev', failShContains: broken])
+        try {
+            h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                          registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                          images: images, deployments: names)
+            assert false: "${broken} failure must fail the deploy"
+        } catch (RuntimeException e) {
+            assert e.message.contains('simulated command failure'): e.message
+        }
+        assert h.sh.any { it.contains("rm -rf 'infra/k8s/overlays/.deploy-dev-42'") }
+    }
+}
+
+test('aborts before cluster commands when the active context is wrong') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                        stdout: 'wrong-context'])
+    try {
+        h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                      registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                      images: images, deployments: names)
+        assert false: 'a context mismatch must abort the deploy'
+    } catch (RuntimeException e) {
+        assert e.message.contains("expected kubectl context 'cg-dev'"): e.message
+    }
+    assert h.sh.every { !it.contains('apply --dry-run=server -k') }
+    assert h.sh.every { !it.contains('apply -k ') }
+    assert h.sh.any { it.contains("rm -rf 'infra/k8s/overlays/.deploy-dev-42'") }
+}
+
+test('rejects a version argument, latest and a missing build version') {
+    def noVersion = newStep('deployKubernetes')
+    try {
+        noVersion.script.call(version: '1.0.0-dev.15')
+        assert false: 'deployKubernetes must not accept a version argument'
+    } catch (RuntimeException e) {
+        assert e.message.contains('env.IMAGE_VERSION only'): e.message
+    }
+
+    def latest = newStep('deployKubernetes', [env: [IMAGE_VERSION: 'latest']])
+    try {
+        latest.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                           registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev')
+        assert false: 'latest must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains('must be a semantic version'): e.message
+    }
+    assert latest.sh.isEmpty(): 'nothing must run without a valid build version'
+}
+
+test('verifies Ingress endpoints and never accepts a 404') {
+    def notFound = newStep('verifyIngress', [stdout: '404\nCURL_EXIT=0', retries: 1])
+    try {
+        notFound.script.call(baseUrl: 'http://ingress.example/',
+                             checks: [[name: 'missing', path: '/x', expected: '404']],
+                             retries: 1)
+        assert false: 'a 404 must fail even when it is the expected code'
+    } catch (RuntimeException e) {
+        assert e.message.contains('endpoints not available'): e.message
+        assert e.message.contains('missing (404)'): e.message
+    }
+    assert notFound.sh.any { it.contains("'http://ingress.example/x'") }
+    assert notFound.sh.any { it.contains('CURL_EXIT=') }
+
+    def ok = newStep('verifyIngress', [stdout: '401\nCURL_EXIT=0', retries: 1])
+    List<Map> results = ok.script.call(baseUrl: 'http://ingress.example',
+                                       checks: [[name: 'identity', path: '/api/v1/identities',
+                                                 expected: '401 403']],
+                                       retries: 1)
+    assert results[0].ok
+    assert results[0].status == '401'
+    assert !results[0].transportError
+    assert results[0].request == 'GET http://ingress.example/api/v1/identities'
+}
+
+test('distinguishes transport errors from HTTP codes and honours expected-code overrides') {
+    def transport = newStep('verifyIngress', [stdout: '000\nCURL_EXIT=7', retries: 1])
+    try {
+        transport.script.call(baseUrl: 'http://ingress.example',
+                              checks: [[name: 'web', path: '/', expected: '200']],
+                              retries: 1)
+        assert false: 'a curl transport error must fail the verification'
+    } catch (RuntimeException e) {
+        assert e.message.contains('curl exit 7'): e.message
+        assert !e.message.contains('HTTP 000'): e.message
+    }
+
+    def override = newStep('verifyIngress', [stdout: '503\nCURL_EXIT=0', retries: 1])
+    List<Map> results = override.script.call(baseUrl: 'http://ingress.example',
+                                             checks: [[name: 'maintenance', path: '/health',
+                                                       expected: '200']],
+                                             expectedCodes: [maintenance: [503]],
+                                             retries: 1)
+    assert results[0].ok
+    assert results[0].expected == '503'
+    assert results[0].status == '503'
+}
+
+test('captures curl exit codes in a real shell and retries transport failures') {
+    File dir = newTempDir('ingress-curl-')
+    File bin = new File(dir, 'bin')
+    File counter = new File(dir, 'counter.txt')
+    writeTestFile(new File(bin, 'curl'), '''#!/usr/bin/env bash
+set -u
+n=0
+if [ -f "$COUNTER" ]; then n=$(cat "$COUNTER"); fi
+n=$((n + 1))
+printf '%s' "$n" > "$COUNTER"
+if [ "$n" -lt 3 ]; then
+  echo 'connection refused' >&2
+  exit 7
+fi
+printf '200'
+''')
+    new File(bin, 'curl').setExecutable(true)
+
+    def h = newStep('verifyIngress', [realShContains: 'curl -s', realShCwd: dir,
+                                      realShPath: bin.absolutePath,
+                                      realShEnv: [COUNTER: counter.absolutePath]])
+    List<Map> results = h.script.call(baseUrl: 'http://ingress.example',
+                                      checks: [[name: 'web', path: '/', expected: '200']],
+                                      retries: 3, intervalSeconds: 0)
+
+    assert h.sh.count { it.contains('curl -s') } == 3
+    assert counter.text.trim() == '3'
+    assert results[0].ok
+    assert results[0].transportError == ''
+    assert results[0].status == '200'
+
+    writeTestFile(new File(bin, 'curl'), '''#!/usr/bin/env bash
+echo 'connection refused' >&2
+exit 7
+''')
+    new File(bin, 'curl').setExecutable(true)
+    def broken = newStep('verifyIngress', [realShContains: 'curl -s', realShCwd: dir,
+                                           realShPath: bin.absolutePath])
+    try {
+        broken.script.call(baseUrl: 'http://ingress.example',
+                           checks: [[name: 'web', path: '/', expected: '200']],
+                           retries: 1)
+        assert false: 'a persistent transport error must fail verification'
+    } catch (RuntimeException e) {
+        assert e.message.contains('curl exit 7'): e.message
+        assert e.message.contains('web (curl exit 7)'): e.message
+    }
+}
+
+test('runs smoke tests from Jenkins against the Ingress without SSH or Compose ports') {
+    String output = [
+        'SMOKE|web home page|GET http://ingress.example/|200|200|true|0',
+        'SMOKE|web runtime configuration|GET http://ingress.example/env-config.js|200|200|true|0',
+        'SMOKE|gateway validates a token|POST http://ingress.example/api/v1/gate/validate|200|200|true|0',
+        'SMOKE|form lists pending surveys|GET http://ingress.example/api/v1/certificates/pending|200|200|true|0',
+        'SMOKE|promotion health stats|GET http://ingress.example/api/v1/health-status/stats|200|200|true|0',
+        'SMOKE|identity requires auth|GET http://ingress.example/api/v1/identities/lookup/id|401 403|401|true|0',
+        'SMOKE|auth login with valid user|POST http://ingress.example/api/v1/auth/login|200|200|true|0',
+        'SMOKE|auth rejects a wrong password|POST http://ingress.example/api/v1/auth/login|401|401|true|0'
+    ].join('\n')
+    def h = newStep('smokeTests', [stdout: output])
+
+    List<Map> results = h.script.call(baseUrl: 'http://ingress.example/', environment: 'dev',
+                                      loginCredentialsId: 'e2e-credential')
+
+    assert results.size() == 8
+    assert h.sh.any { it == 'bash smoke-tests/smoke-run.sh' }
+    assert h.sh.every { !it.contains('ssh ') && !it.contains('scp ') && !it.contains(':8081') }
+    assert h.withCredentials[0][0].usernameVariable == 'SMOKE_USER'
+    String credentialCommand = h.sh.find { it.contains('login.json') }
+    assert credentialCommand.contains('umask 077'): credentialCommand
+    assert credentialCommand.contains('chmod 600 smoke-tests/login.json'): credentialCommand
+    assert !credentialCommand.contains('SMOKE_PASS='): credentialCommand
+    assert h.sh.any { it.contains("rm -f smoke-tests/login.json smoke-tests/login-bad.json") &&
+                      it.contains("test ! -e smoke-tests/login.json") }
+    String script = h.written['smoke-tests/smoke-run.sh']
+    assert script.contains("'http://ingress.example/'")
+    assert !script.contains('localhost:')
+    assert script.contains('if [ "$code" = "404" ]; then')
+    assert !script.contains('SMOKE_PASS')
+    assert h.junit == ['smoke-tests/smoke-dev.xml']
+    assert h.archived.contains('smoke-tests/smoke-dev.txt')
+}
+
+test('fails the build when a smoke check reports a failure') {
+    String output = [
+        'SMOKE|web home page|GET http://ingress.example/|200|200|true|0',
+        'SMOKE|auth login with valid user|POST http://ingress.example/api/v1/auth/login|200|401|false|0'
+    ].join('\n')
+    def h = newStep('smokeTests', [stdout: output, loginCredentialsId: null])
+    List<Map> checks = [[name: 'web home page', path: '/', expected: '200'],
+                        [name: 'auth login with valid user', method: 'POST',
+                         path: '/api/v1/auth/login', expected: '200']]
+    try {
+        h.script.call(baseUrl: 'http://ingress.example', environment: 'dev',
+                      loginCredentialsId: null, checks: checks)
+        assert false: 'a failing smoke check must fail the step'
+    } catch (RuntimeException e) {
+        assert e.message.contains('failed the smoke tests'): e.message
+        assert e.message.contains('auth login with valid user'): e.message
+    }
+    assert h.currentBuild.description.contains('smoke tests FAILED on dev')
+}
+
+test('fails when the smoke credential files cannot be removed') {
+    def h = newStep('smokeTests', [stdout: '', loginCredentialsId: null,
+                                   failShContains: 'rm -f smoke-tests/login.json'])
+    try {
+        h.script.call(baseUrl: 'http://ingress.example', environment: 'dev',
+                      loginCredentialsId: null)
+        assert false: 'a failed cleanup must not be hidden'
+    } catch (RuntimeException e) {
+        assert e.message.contains('simulated command failure'): e.message
+    }
+}
+
+test('does not trace the smoke password and keeps credential files private') {
+    File dir = newTempDir('smoke-secrets-')
+    new File(dir, 'smoke-tests').mkdirs()
+    String canary = 'CANARY-SMOKE-SECRET'
+    def h = newStep('smokeTests', [stdout: '', realShContains: 'umask 077',
+                                   realShCwd: dir,
+                                   realShEnv: [SMOKE_USER: 'smoke-user', SMOKE_PASS: canary]])
+    try {
+        h.script.call(baseUrl: 'http://ingress.example', environment: 'dev')
+    } catch (RuntimeException ignored) {
+    }
+
+    String credentialCommand = h.sh.find { it.contains('umask 077') }
+    assert credentialCommand.contains('set +x'): credentialCommand
+    assert !h.shellOutputs[0].contains(canary): h.shellOutputs[0]
+    File login = new File(dir, 'smoke-tests/login.json')
+    File badLogin = new File(dir, 'smoke-tests/login-bad.json')
+    assert login.exists() && badLogin.exists()
+    def expectedMode = [java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                        java.nio.file.attribute.PosixFilePermission.OWNER_WRITE] as Set
+    assert java.nio.file.Files.getPosixFilePermissions(login.toPath()) == expectedMode
+    assert java.nio.file.Files.getPosixFilePermissions(badLogin.toPath()) == expectedMode
+    assert login.text.contains(canary): 'the canary must reach the credential file, not the log'
+
+    String cleanup = h.sh.find { it.contains('rm -f smoke-tests/login.json') }
+    assert cleanup.contains('smoke-tests/body.tmp'): cleanup
+    assert cleanup.contains('smoke-tests/smoke-run.sh'): cleanup
+    assert runShell(cleanup, dir).exit == 0
+    assert !login.exists() && !badLogin.exists()
+}
+
+test('creates a private smoke script and removes it during cleanup') {
+    File dir = newTempDir('smoke-script-')
+    File script = writeTestFile(new File(dir, 'smoke-tests/smoke-run.sh'),
+                                '#!/usr/bin/env bash\nexit 0\n')
+    File body = writeTestFile(new File(dir, 'smoke-tests/body.tmp'), 'previous-run-token')
+
+    def privateStep = newStep('smokeTests', [stdout: '', loginCredentialsId: null,
+                                              realShContains: 'chmod 600 smoke-tests/smoke-run.sh',
+                                              realShCwd: dir])
+    try {
+        privateStep.script.call(baseUrl: 'http://ingress.example', environment: 'dev',
+                                loginCredentialsId: null)
+    } catch (RuntimeException ignored) {
+    }
+    def expectedMode = [java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                        java.nio.file.attribute.PosixFilePermission.OWNER_WRITE] as Set
+    assert java.nio.file.Files.getPosixFilePermissions(script.toPath()) == expectedMode
+
+    def cleanupStep = newStep('smokeTests', [stdout: '', loginCredentialsId: null,
+                                              realShContains: 'rm -f smoke-tests/login.json',
+                                              realShCwd: dir])
+    try {
+        cleanupStep.script.call(baseUrl: 'http://ingress.example', environment: 'dev',
+                                loginCredentialsId: null)
+    } catch (RuntimeException ignored) {
+    }
+    String cleanup = cleanupStep.sh.find { it.contains('rm -f smoke-tests/login.json') }
+    assert cleanup.contains('smoke-tests/smoke-run.sh'): cleanup
+    assert !script.exists(): 'smoke-run.sh must be removed during cleanup'
+    assert !body.exists(): 'body.tmp must be removed during cleanup'
+}
+
+test('the smoke script removes a private body.tmp through a real shell trap') {
+    File dir = newTempDir('smoke-body-')
+    File bin = new File(dir, 'bin')
+    File modeFile = new File(dir, 'mode.txt')
+    writeTestFile(new File(bin, 'curl'), '''#!/usr/bin/env bash
+set -u
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$arg"; fi
+  prev="$arg"
+done
+printf '{"token":"fake-token"}' > "$out"
+stat -c '%a' "$out" > "$MODE_FILE"
+printf '200'
+''')
+    new File(bin, 'curl').setExecutable(true)
+
+    List<Map> checks = [[name: 'web home page', path: '/', expected: '200']]
+    def h = newStep('smokeTests', [stdout: 'SMOKE|web home page|GET http://ingress.example/|200|200|true|0'])
+    h.script.call(baseUrl: 'http://ingress.example', environment: 'dev',
+                  loginCredentialsId: null, checks: checks, attempts: 1)
+    writeTestFile(new File(dir, 'smoke-tests/smoke-run.sh'), h.written['smoke-tests/smoke-run.sh'])
+
+    def result = runShell('bash smoke-tests/smoke-run.sh', dir,
+                          [MODE_FILE: modeFile.absolutePath], bin.absolutePath)
+    assert result.exit == 0: result.stdout
+    assert result.stdout.contains('SMOKE|web home page'): result.stdout
+    assert modeFile.text.trim() == '600': modeFile.text
+    assert !new File(dir, 'smoke-tests/body.tmp').exists(): 'body.tmp must be removed by the trap'
+}
+
+test('a smoke cleanup failure does not replace the original error') {
+    def h = newStep('smokeTests', [stdout: '', loginCredentialsId: null,
+                                   failShContainsList: [
+                                       [contains: 'bash smoke-tests/smoke-run.sh',
+                                        message: 'ORIGINAL SMOKE ERROR'],
+                                       [contains: 'rm -f smoke-tests/login.json',
+                                        message: 'CLEANUP ERROR']]])
+    try {
+        h.script.call(baseUrl: 'http://ingress.example', environment: 'dev',
+                      loginCredentialsId: null)
+        assert false: 'the original smoke error must propagate'
+    } catch (RuntimeException e) {
+        assert e.message == 'ORIGINAL SMOKE ERROR': e.message
+    }
+    assert h.logs.any { it.toString().contains('cleanup failed after the original error') &&
+                        it.toString().contains('CLEANUP ERROR') }
+}
+
+test('promotes with Kubernetes, keeps the approval and records evidence') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def h = newStep('promoteEnvironment', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42',
+                                                 BRANCH_NAME: 'dev']])
+
+    h.script.call(from: 'dev', to: 'stage', version: '1.0.0-dev.15', manual: true,
+                  context: 'cg-stage', namespace: 'circleguard', registry: '10.20.1.230:8082',
+                  overlayPaths: [:], ingressUrls: [stage: 'http://stage.example/'],
+                  images: [[name: 'circleguard/web']], deployments: names,
+                  verifyPaths: [[name: 'web', path: '/', expected: '200']],
+                  smokeTests: true, smokeCredentialsId: 'e2e-credential')
+
+    assert h.trace.any { it == 'deployKubernetes(stage)' }
+    assert h.trace.any { it == 'verifyIngress(http://stage.example)' }
+    assert h.trace.any { it == 'smokeTests(http://stage.example)' }
+    assert h.inputs.size() == 1
+    assert h.inputs[0].ok == 'Promote'
+    assert h.inputs[0].submitterParameter == 'approvedBy'
+    assert h.inputs[0].timeout == 120
+    assert h.inputs[0].timeUnit == 'MINUTES'
+    String record = h.written['promotion-record.txt']
+    assert record.contains('Version      : 1.0.0-dev.15')
+    assert record.contains('Route        : dev -> stage')
+    assert record.contains('Condition    : manual approval (input) by admin')
+    assert record.contains('Approved by  : admin')
+    assert record.contains('Context      : cg-stage')
+    assert record.contains('Namespace    : circleguard')
+    assert record.contains('Manifest     : k8s/rendered-stage-42.yaml')
+    assert h.archived.contains('promotion-record.txt')
+}
+
+test('requires env.IMAGE_VERSION and never derives it from the version argument') {
+    def missing = newStep('promoteEnvironment', [env: [:]])
+    try {
+        missing.script.call(from: 'dev', to: 'stage', version: '1.0.0-dev.15')
+        assert false: 'promotion without env.IMAGE_VERSION must fail'
+    } catch (RuntimeException e) {
+        assert e.message.contains('env.IMAGE_VERSION from this build is required'): e.message
+    }
+    assert missing.env.IMAGE_VERSION == null: 'params.version must never populate env.IMAGE_VERSION'
+
+    def mismatch = newStep('promoteEnvironment', [env: [IMAGE_VERSION: '1.0.0-dev.16']])
+    try {
+        mismatch.script.call(from: 'dev', to: 'stage', version: '1.0.0-dev.15')
+        assert false: 'a version mismatch must fail'
+    } catch (RuntimeException e) {
+        assert e.message.contains('differs from env.IMAGE_VERSION'): e.message
+    }
+}
+
+test('a rejected or expired approval stops the promotion') {
+    def h = newStep('promoteEnvironment', [env: [IMAGE_VERSION: '1.0.0-dev.15'],
+                                           failInput: new RuntimeException('approval expired')])
+    try {
+        h.script.call(from: 'dev', to: 'stage', version: '1.0.0-dev.15', manual: true,
+                      context: 'cg-stage', namespace: 'circleguard-stage',
+                      ingressUrls: [stage: 'http://stage.example'])
+        assert false: 'an expired approval must stop the promotion'
+    } catch (RuntimeException e) {
+        assert e.message.contains('approval expired'): e.message
+    }
+    assert h.inputs.size() == 1
+    assert !h.trace.any { it.startsWith('deployKubernetes(') }
+    assert !h.written.containsKey('promotion-record.txt')
+}
+
+test('rejects a manual promotion when input does not identify an approver') {
+    [null, '', '   ', [approvedBy: null]].each { answer ->
+        def h = newStep('promoteEnvironment', [env: [IMAGE_VERSION: '1.0.0-dev.15'],
+                                               inputResult: answer])
+        try {
+            h.script.call(from: 'dev', to: 'stage', version: '1.0.0-dev.15', manual: true,
+                          context: 'cg-stage', namespace: 'circleguard',
+                          ingressUrls: [stage: 'http://stage.example'])
+            assert false: "an approval without an approver must fail: ${answer}"
+        } catch (RuntimeException e) {
+            assert e.message.contains('manual approval did not identify an approver'): e.message
+        }
+        assert h.inputs.size() == 1
+        assert !h.trace.any { it.startsWith('deployKubernetes(') }
+        assert !h.written.containsKey('promotion-record.txt')
+    }
+}
+
+test('the pipeline keeps its stages and uses only the Kubernetes deploy path') {
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+    ['Checkout', 'Build', 'Tests', 'Integration tests', 'SonarQube', 'Publish images',
+     'Deploy', 'Verify deployment', 'Smoke tests', 'E2E tests',
+     'Promote to stage', 'Promote to prod'].each { String stage ->
+        assert text.contains("stage('${stage}')"): "stage ${stage} disappeared"
+    }
+
+    assert text.contains('deployKubernetes(')
+    assert text.contains('verifyIngress(')
+    assert text.contains('smokeTests(')
+    assert text.contains('baseUrl: ingressUrl')
+    assert text.contains('authBaseUrl: ingressUrl')
+    assert text.contains('gatewayBaseUrl: ingressUrl')
+    assert text.contains("cfg.contextFor('stage')")
+    assert text.contains("cfg.namespaceFor('prod')")
+    assert !text.contains('deployEnvironment(')
+    assert !text.contains('verifyServices(')
+    assert !text.contains('DEPLOY_HOST')
+    assert !text.contains('cfg.services')
+    assert !text.contains(':8081')
+}
+
+test('keeps the publish registry separate from the Kubernetes registry') {
+    def cfg = newConfig([deploy: true, environment: 'dev', k8sContext: 'cg-dev',
+                         k8sIngressUrls: [dev: 'http://dev.example']])
+
+    assert cfg.registry == 'localhost:8082'
+    assert cfg.k8sRegistry == '10.20.1.230:8082'
+    assert cfg.registry != cfg.k8sRegistry
+    assert cfg.images.size() == 9
+    assert cfg.images.collect { it.name }.containsAll([
+        'circleguard/notification-service', 'circleguard/dashboard-service', 'circleguard/file-service'])
+    assert cfg.k8sDeployments.size() == 9
+    assert cfg.k8sVerifyPaths.size() == 6
+    assert cfg.k8sIngressUrls.dev == 'http://dev.example'
+
+    try {
+        newConfig([deploy: true, environment: 'dev',
+                   k8sIngressUrls: [dev: 'http://dev.example']])
+        assert false: 'a deploy without a context must be rejected'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains('k8sContext is required'): e.message
+    }
+}
+
+test('resolves each context but keeps the single manifest namespace') {
+    def cfg = newConfig([deploy: true, promote: true, environment: 'dev',
+                         k8sContext: 'cg-dev', k8sNamespace: 'circleguard',
+                         k8sContexts: [stage: 'cg-stage', prod: 'cg-prod'],
+                         k8sIngressUrls: [dev: 'http://dev.example',
+                                          stage: 'http://stage.example',
+                                          prod: 'http://prod.example']])
+
+    assert cfg.contextFor('dev') == 'cg-dev'
+    assert cfg.contextFor('stage') == 'cg-stage'
+    assert cfg.contextFor('prod') == 'cg-prod'
+    assert cfg.namespaceFor('dev') == 'circleguard'
+    assert cfg.namespaceFor('stage') == 'circleguard'
+    assert cfg.namespaceFor('prod') == 'circleguard'
+}
+
+test('rejects namespace configurations that disagree with the manifests') {
+    try {
+        newConfig([deploy: true, environment: 'dev', k8sContext: 'cg-dev',
+                   k8sNamespace: 'circleguard-other',
+                   k8sIngressUrls: [dev: 'http://dev.example']])
+        assert false: 'a non-manifest namespace must be rejected'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains("manifests hardcode namespace 'circleguard'"): e.message
+        assert e.message.contains('environment=dev'): e.message
+    }
+
+    try {
+        newConfig([deploy: true, promote: true, environment: 'dev',
+                   k8sContext: 'cg-dev',
+                   k8sNamespaces: [stage: 'circleguard-stage'],
+                   k8sIngressUrls: [dev: 'http://dev.example',
+                                    stage: 'http://stage.example',
+                                    prod: 'http://prod.example']])
+        assert false: 'a stage namespace override must be rejected'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains("k8sNamespaces['stage'] cannot select another namespace"): e.message
+    }
+}
+
+test('validates context, namespace and URL of every promotion target up front') {
+    try {
+        newConfig([deploy: true, promote: true, environment: 'dev',
+                   k8sContext: 'cg-dev',
+                   k8sContexts: [stage: 'cg-stage', prod: 'cg-prod'],
+                   k8sIngressUrls: [dev: 'http://dev.example',
+                                    stage: 'http://stage.example']])
+        assert false: 'a missing prod ingress URL must be rejected at configuration time'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains("k8sIngressUrls['prod'] is required"): e.message
+    }
+
+    try {
+        newConfig([deploy: true, promote: true, environment: 'dev',
+                   k8sContext: '',
+                   k8sContexts: [dev: 'cg-dev', stage: 'cg-stage'],
+                   k8sIngressUrls: [dev: 'http://dev.example',
+                                    stage: 'http://stage.example',
+                                    prod: 'http://prod.example']])
+        assert false: 'a missing prod context must be rejected at configuration time'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains('k8sContext is required'): e.message
+        assert e.message.contains('environment=prod'): e.message
+    }
+}
+
+test('detects the current consumer configuration blocker without changing its Jenkinsfile') {
+    Map consumer = [integrationTests: true, sonar: false, publish: true,
+                    deploy: true, environment: 'dev', e2e: true, promote: true,
+                    services: [[name: 'web', port: 8081]],
+                    discordCredentialsId: 'discord-webhook-url']
+    try {
+        newConfig(consumer)
+        assert false: 'the current consumer config must be reported as incompatible'
+    } catch (IllegalArgumentException e) {
+        assert e.message.contains('k8sContext is required'): e.message
+        assert e.message.contains('environment=dev'): e.message
+    }
 }
 
 test('documents the image scan in the READMEs') {
