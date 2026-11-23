@@ -4055,6 +4055,31 @@ metadata:
     assert bad.sh.every { !it.contains(' apply -k ') }
 }
 
+// The real waitForQualityGate returns the plugin's QGStatus object, not a Map
+class FakeQGStatus {
+    String status
+    FakeQGStatus(String status) { this.status = status }
+}
+
+test('accepts the QGStatus object returned by waitForQualityGate') {
+    ['OK', 'ERROR'].each { String result ->
+        def h = newStep('sonarAnalysis')
+        h.script.binding.setVariable('withSonarQubeEnv', { Object server, Closure c -> c.call() })
+        h.script.binding.setVariable('waitForQualityGate', { Map p ->
+            assert p.abortPipeline == false
+            new FakeQGStatus(result)
+        })
+        try {
+            h.script.call(server: 'CircleGuard-SonarQube', projectKey: 'CircleGuard')
+            assert result == 'OK': 'a failed gate must stop the build'
+        } catch (RuntimeException e) {
+            assert result == 'ERROR': e.message
+            assert e.message.contains('quality gate ERROR'): e.message
+        }
+        assert h.written['sonar-quality-gate.txt']?.contains("status=${result}"): h.written
+    }
+}
+
 test('validates the rendered application scope in source') {
     String text = new File(root, 'vars/deployKubernetes.groovy').text
     assert text.indexOf('validateRenderedManifest(renderedManifest') > 0
