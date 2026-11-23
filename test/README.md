@@ -3,8 +3,8 @@
 Behavioural tests for the reusable steps. They are **unit tests**: every Jenkins
 step (`sh`, `echo`, `error`, `env`, `currentBuild`, `file`, `fileExists`,
 `readFile`, `writeFile`, `archiveArtifacts`, `junit`, `input`, `withEnv`,
-`withCredentials`, `usernamePassword`, `timeout`) is replaced by an in-memory
-stub, so the tests need
+`withCredentials`, `usernamePassword`, `timeout`, `unstable`, `publishHTML`,
+`junit`) is replaced by an in-memory stub, so the tests need
 
 - **no Docker image** (nothing is downloaded),
 - **no network**,
@@ -28,7 +28,7 @@ cleanup traps are verified as real shell behaviour, not only as source text.
 of the steps (commands built, gates, provenance checks, messages and evidence);
 they are **not** a validation of Jenkins, Docker, Terraform or AWS — those real
 validations are listed in the main README (*Known limitations and follow-ups*)
-and are still pending. The suite currently runs **177 tests**.
+and are still pending. The suite currently runs **200 tests**.
 
 ## Why `test/` and not `src/`
 
@@ -43,12 +43,14 @@ They only need a Groovy runtime (any Groovy 3/4/5 works; Groovy is already in
 the Gradle caches of the developer machines, so nothing has to be installed):
 
 ```bash
-# from the root of the library
-java -cp "$(find ~/.gradle -name 'groovy-3.0.25.jar' | head -1)" \
-     groovy.ui.GroovyMain test/StepTests.groovy
+# from the root of the library — groovy-json is REQUIRED: zapBaselineScan uses
+# JsonSlurper to read the ZAP report and the tests build its fixtures with it.
+GROOVY=/home/santi/.gradle/caches/modules-2/files-2.1/org.apache.groovy/groovy/5.0.8/e2ff7e471b4693d07877409761207c6c27c88b5a/groovy-5.0.8.jar
+GROOVY_JSON=/home/santi/.gradle/caches/modules-2/files-2.1/org.apache.groovy/groovy-json/5.0.8/586342fe9600f7f5c9f0c0ec1661a376412f6970/groovy-json-5.0.8.jar
+java -cp "$GROOVY:$GROOVY_JSON" groovy.ui.GroovyMain test/StepTests.groovy
 
 # or passing the root of the library explicitly
-java -cp <groovy.jar> groovy.ui.GroovyMain test/StepTests.groovy /path/to/circleguard-jenkins-library
+java -cp "$GROOVY:$GROOVY_JSON" groovy.ui.GroovyMain test/StepTests.groovy /path/to/circleguard-jenkins-library
 ```
 
 Exit code `0` means all tests passed; `1` reports the failing ones.
@@ -75,3 +77,7 @@ Exit code `0` means all tests passed; `1` reports the failing ones.
 | `smokeTests` | eight functional checks executed from the Jenkins agent over HTTP against the Ingress, credential files with **`set +x`, `umask 077` and `chmod 600`**, generated `smoke-run.sh` created with **`chmod 600`**, values never printed, **`body.tmp` removed by a real shell trap**, **script and credential files removed in a verified `finally` (cleanup failure fails the build without hiding the original error)**, failing checks fail the step with `smoke tests FAILED on <env>`, JUnit + text reports, no `ssh`/`scp`/Compose ports, `404` never accepted |
 | `promoteEnvironment` | Kubernetes deploy of the **same `env.IMAGE_VERSION`**; a missing or mismatched build version fails and `params.version` **never populates** `env.IMAGE_VERSION` (`latest` is rejected by the step but not covered by the test); manual `input` preserved (rejection/expiration and a `null`/empty approver stop the promotion), the test asserts approver/approval condition/version/route/context/namespace and the build-specific manifest path produced by `deployKubernetes`; the step also writes overlay and Ingress lines, no Compose/SSH state |
 | `circleguardPipeline` (Kubernetes migration) | keeps all original stages, replaces `deployEnvironment`/`verifyServices` with `deployKubernetes`/`verifyIngress`, passes the Ingress URL to smoke and E2E stages, promotes with `images`/`deployments`/`verifyPaths` using **`cfg.contextFor()`/`cfg.namespaceFor()` for the target environment**, and rejects deploy configuration without a context or Ingress URL |
+| `zapBaselineScan` | pre-flight `curl` **before** any container (HTTP `000` → TECHNICAL FAILURE, never a clean scan); `docker run` of the **pinned** image with the workspace mounted at **`/zap/wrk`** (no host path, no `-p`, no `-c`, no `-I`), `-m`/`-T`/`-D` flags, `-j` only when requested and **shell-quoted targets**; `rm -f` of only this build's reports; evidence archived + published as HTML **before** `error()`/`unstable()`; severity read from **`riskcode`**, exit **0/1/2** all valid, exit **3** / missing or empty JSON / unknown `riskcode` = **TECHNICAL FAILURE**; High blocks, Medium marks unstable; aggregation across targets (one High blocks all), current exceptions suppress while **expired/invalid/out-of-scope** ones fail closed, JUnit + text summary, guards (no target, unsafe URL, `:latest`, short timeout, bad prefix/severity, bad workspace) |
+| `qualityReport` | single shell manifest (`KIND\|path\|epoch`), JaCoCo root-level LINE counters parsed without `XmlSlurper`, JUnit totals per service/kind, Sonar status, Trivy and ZAP summaries, Markdown **and** HTML renderers, staleness by build start time, unreadable/empty/old evidence, configured gate per service without changing the result, invalid prefix and `sh` errors swallowed so `post { always }` is never broken |
+| `PipelineConfig` (ZAP & report) | ZAP **off by default** with a pinned image and a DEV-only branch, parameters accepted from the Jenkinsfile, and constructor rejection of a short Jenkins budget, a non-positive ZAP ceiling, a mutable image, unsafe report names/URLs and an out-of-range coverage threshold; `zapScan: true` without `deploy` is refused; the consolidated report is **on by default** and informational |
+| `circleguardPipeline` (ZAP & report) | source-level checks: the `OWASP ZAP security scan` stage sits **after Verify deployment and before Smoke tests**, is gated by flag **and** branch **and** deploy gates, passes every `cfg.zap*` parameter, defaults the target to `k8sIngressUrl(cfg, cfg.environment)` and writes the status into the build description; `qualityReport()` is called from `post { always }` **after** `publishTestReports()` and before the cleanup |

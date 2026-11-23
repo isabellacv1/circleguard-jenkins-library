@@ -399,6 +399,51 @@ def call(Map rawConfig = [:]) {
                 }
             }
 
+            // OWASP ZAP baseline scan of what this build just deployed (passive:
+            // spider + passive rules, no attack). It sits between the verification
+            // and the functional tests on purpose: the target is guaranteed to
+            // answer (Verify deployment), and a blocking finding stops the build
+            // BEFORE the slower smoke/E2E/promotion stages run. Gate: the opt-in
+            // flag AND a branch in zapBranches, plus the deploy gates, because
+            // without a deployment there is nothing to scan.
+            stage('OWASP ZAP security scan') {
+                when {
+                    expression {
+                        cfg.zapScan && cfg.zapBranches.contains(env.BRANCH_NAME) &&
+                        cfg.deploy && cfg.deployBranches.contains(env.BRANCH_NAME)
+                    }
+                }
+                options {
+                    timeout(time: cfg.zapTimeout, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        // No explicit target means "the Ingress base URL of this
+                        // environment", the same URL verification, smoke and E2E
+                        // use: the scan can never point somewhere else by accident.
+                        List<String> targets = cfg.zapTargets ?
+                                cfg.zapTargets : [k8sIngressUrl(cfg, cfg.environment)]
+                        Map zap = zapBaselineScan(
+                            targets: targets,
+                            image: cfg.zapImage,
+                            spiderMinutes: cfg.zapSpiderMinutes,
+                            maxTimeMinutes: cfg.zapMaxTimeMinutes,
+                            delaySeconds: cfg.zapDelaySeconds,
+                            clientSpider: cfg.zapClientSpider,
+                            timeout: cfg.zapTimeout,
+                            blockSeverities: cfg.zapBlockSeverities,
+                            warnSeverities: cfg.zapWarnSeverities,
+                            exceptionsFile: cfg.zapExceptionsFile,
+                            reportsPrefix: cfg.zapReportsPrefix,
+                            summaryPrefix: cfg.zapSummaryPrefix
+                        )
+                        String note = "ZAP ${zap.status}"
+                        currentBuild.description = currentBuild.description ?
+                                "${currentBuild.description} · ${note}" : note
+                    }
+                }
+            }
+
             // HU-15: functional smoke tests after the deployment. A deployment that does not
             // pass them is marked as failed and the results are kept in the build.
             stage('Smoke tests') {
@@ -520,6 +565,21 @@ def call(Map rawConfig = [:]) {
         post {
             always {
                 publishTestReports()
+                // Consolidated coverage & quality report (E2.7). Informational:
+                // it only reads the evidence this build produced and never
+                // changes the result, so it runs before the cleanup below and
+                // after the test reports it summarises.
+                script {
+                    if (cfg.qualityReport) {
+                        qualityReport(
+                            reportsPrefix: cfg.qualityReportsPrefix,
+                            zapSummaryPrefix: cfg.zapSummaryPrefix,
+                            minCoveragePercent: cfg.qualityMinCoveragePercent,
+                            gatedServices: cfg.qualityGatedServices,
+                            environment: cfg.environment
+                        )
+                    }
+                }
                 // Remove BuildKit cache, dangling images and test leftovers (never fails the build)
                 script {
                     if (cfg.dockerCleanup) {

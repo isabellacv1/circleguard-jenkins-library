@@ -160,6 +160,50 @@ class PipelineConfig implements Serializable {
     boolean terraformApplyProd = false
     boolean terraformApprovalProd = false
 
+    // OWASP ZAP baseline scan (passive: spider + passive rules) of the DEPLOYED
+    // environment. Off by default: it needs the application to be deployed and
+    // verified, and the first run downloads the pinned ZAP image (~1.5 GB).
+    // The target is the Ingress base URL used by verify/smoke/E2E, so the scan
+    // always points at the environment this build just deployed.
+    boolean zapScan = false
+    // Official image, pinned to an explicit version. `:bare` has no zap-baseline.py
+    // and `:stable`/`:latest`/`:weekly` are mutable, so only an explicit version
+    // is accepted (the step rejects anything else).
+    String zapImage = 'ghcr.io/zaproxy/zaproxy:2.17.0'
+    // Empty (default) means "the Ingress base URL of `environment`". An explicit
+    // list is only needed to scan additional paths of the same deployment.
+    List<String> zapTargets = []
+    int zapSpiderMinutes = 1              // -m: minutes given to the spider
+    int zapMaxTimeMinutes = 10            // -T: ceiling of ZAP (spider + passive scan)
+    int zapDelaySeconds = 0               // -D: wait before the passive scan
+    boolean zapClientSpider = false       // -j: JavaScript spider (off in this phase)
+    int zapTimeout = 15                   // Jenkins budget; MUST be > zapMaxTimeMinutes
+    List<String> zapBranches = ['dev']    // flag AND branch, like every other gate
+    List<String> zapBlockSeverities = ['High', 'Critical']  // error(...) after the evidence
+    List<String> zapWarnSeverities = ['Medium']             // unstable(...), never blocking
+    String zapExceptionsFile = '.zapignore.yaml'  // read only when it exists
+    String zapReportsPrefix = 'zap-report'        // <prefix>-<build>-<target-slug>.<ext>
+    String zapSummaryPrefix = 'zap-summary'       // <prefix>-<build>.txt
+
+    // Consolidated coverage & quality report (E2.7): reads the evidence already
+    // produced by this build (JaCoCo, JUnit, SonarQube, Trivy, ZAP) and publishes
+    // a single Markdown + HTML report. Informational only: it never changes the
+    // result of the build, and it runs in post { always } so the evidence is kept
+    // even when a stage fails.
+    boolean qualityReport = true
+    String qualityReportsPrefix = 'quality-report'
+    // Threshold shown (and checked) per service by the consolidated report. It
+    // mirrors the jacocoTestCoverageVerification rule of the application's
+    // build.gradle.kts, so the report and the build agree on what "enough" is.
+    int qualityMinCoveragePercent = 60
+    List<String> qualityGatedServices = [
+        'circleguard-auth-service',
+        'circleguard-identity-service',
+        'circleguard-promotion-service',
+        'circleguard-form-service',
+        'circleguard-gateway-service',
+    ]
+
     int buildTimeout = 30
     int testTimeout = 45
     int integrationTimeout = 30
@@ -227,6 +271,24 @@ class PipelineConfig implements Serializable {
         this.trivyImageBranches = c.trivyImageBranches ?: this.trivyImageBranches
         this.trivyImageTimeout = c.trivyImageTimeout ? c.trivyImageTimeout as int : this.trivyImageTimeout
         this.trivyImageIgnoreFile = c.trivyImageIgnoreFile ?: this.trivyImageIgnoreFile
+        this.zapScan = c.zapScan != null ? c.zapScan as boolean : this.zapScan
+        this.zapImage = c.zapImage ?: this.zapImage
+        this.zapTargets = c.zapTargets ?: this.zapTargets
+        this.zapSpiderMinutes = (c.containsKey('zapSpiderMinutes') && c.zapSpiderMinutes != null) ? c.zapSpiderMinutes as int : this.zapSpiderMinutes
+        this.zapMaxTimeMinutes = (c.containsKey('zapMaxTimeMinutes') && c.zapMaxTimeMinutes != null) ? c.zapMaxTimeMinutes as int : this.zapMaxTimeMinutes
+        this.zapDelaySeconds = (c.containsKey('zapDelaySeconds') && c.zapDelaySeconds != null) ? c.zapDelaySeconds as int : this.zapDelaySeconds
+        this.zapClientSpider = c.zapClientSpider != null ? c.zapClientSpider as boolean : this.zapClientSpider
+        this.zapTimeout = (c.containsKey('zapTimeout') && c.zapTimeout != null) ? c.zapTimeout as int : this.zapTimeout
+        this.zapBranches = c.zapBranches ?: this.zapBranches
+        this.zapBlockSeverities = c.zapBlockSeverities ?: this.zapBlockSeverities
+        this.zapWarnSeverities = c.zapWarnSeverities ?: this.zapWarnSeverities
+        this.zapExceptionsFile = c.zapExceptionsFile ?: this.zapExceptionsFile
+        this.zapReportsPrefix = c.zapReportsPrefix ?: this.zapReportsPrefix
+        this.zapSummaryPrefix = c.zapSummaryPrefix ?: this.zapSummaryPrefix
+        this.qualityReport = c.qualityReport != null ? c.qualityReport as boolean : this.qualityReport
+        this.qualityReportsPrefix = c.qualityReportsPrefix ?: this.qualityReportsPrefix
+        this.qualityMinCoveragePercent = (c.containsKey('qualityMinCoveragePercent') && c.qualityMinCoveragePercent != null) ? c.qualityMinCoveragePercent as int : this.qualityMinCoveragePercent
+        this.qualityGatedServices = c.qualityGatedServices ?: this.qualityGatedServices
         this.terraformPlan = c.terraformPlan != null ? c.terraformPlan as boolean : this.terraformPlan
         this.terraformPlanRoot = c.terraformPlanRoot ?: this.terraformPlanRoot
         this.terraformPlanBranches = c.terraformPlanBranches ?: this.terraformPlanBranches
@@ -321,6 +383,76 @@ class PipelineConfig implements Serializable {
         if (this.terraformApprovalSubmitter == null || !this.terraformApprovalSubmitter.trim()) {
             throw new IllegalArgumentException(
                     'PipelineConfig: terraformApprovalSubmitter must not be empty')
+        }
+
+        // OWASP ZAP: fail fast on a configuration that could never produce a
+        // meaningful result. Checked for EVERY build (even with zapScan off) so a
+        // typo is caught before the stage is enabled, like the approval settings.
+        if (this.zapMaxTimeMinutes <= 0) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: zapMaxTimeMinutes must be > 0 minutes, got ' +
+                    this.zapMaxTimeMinutes)
+        }
+        if (this.zapTimeout <= this.zapMaxTimeMinutes) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: zapTimeout (' + this.zapTimeout + ' min) must be GREATER ' +
+                    'than zapMaxTimeMinutes (' + this.zapMaxTimeMinutes +
+                    ' min): the Jenkins budget has to outlive the ZAP run itself')
+        }
+        if (this.zapSpiderMinutes < 0) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: zapSpiderMinutes must be >= 0, got ' + this.zapSpiderMinutes)
+        }
+        if (this.zapDelaySeconds < 0) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: zapDelaySeconds must be >= 0, got ' + this.zapDelaySeconds)
+        }
+        if (this.zapBlockSeverities == null || this.zapBlockSeverities.isEmpty()) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: zapBlockSeverities must not be empty (nothing would block)')
+        }
+        if (this.zapBranches == null || this.zapBranches.isEmpty()) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: zapBranches must not be empty (no branch could run the scan)')
+        }
+        // The image goes into a `docker run` command: only an explicit version is
+        // accepted, exactly like runInContainer and trivyImageScan.
+        String zapLastSegment = this.zapImage.tokenize('/').last()
+        if (!zapLastSegment.contains(':') || zapLastSegment.endsWith(':latest')) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: zapImage must be pinned to an explicit version ' +
+                    '(never latest): ' + this.zapImage)
+        }
+        // Report names are interpolated into shell commands and into archiveArtifacts.
+        [this.zapReportsPrefix, this.zapSummaryPrefix, this.zapExceptionsFile,
+         this.qualityReportsPrefix].each { String plainName ->
+            if (plainName == null || !(plainName ==~ /[A-Za-z0-9._-]+/)) {
+                throw new IllegalArgumentException(
+                        "PipelineConfig: '${plainName}' must be a plain file name " +
+                        '(no path, no spaces, no metacharacters)')
+            }
+        }
+        this.zapTargets.each { String target ->
+            if (!(target ==~ /https?:\/\/[A-Za-z0-9._~:\/?#&=%+,@-]+/)) {
+                throw new IllegalArgumentException(
+                        'PipelineConfig: zapTargets accepts plain http/https URLs only: ' + target)
+            }
+        }
+        // ZAP scans what this build deployed: without a deployment there is no
+        // target, so the switch alone can never be enough.
+        if (this.zapScan && !this.deploy) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: zapScan requires deploy=true (the scan targets the ' +
+                    'environment deployed by this build)')
+        }
+        if (this.zapScan && this.zapBranches.isEmpty()) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: zapScan requires at least one branch in zapBranches')
+        }
+        if (this.qualityMinCoveragePercent < 0 || this.qualityMinCoveragePercent > 100) {
+            throw new IllegalArgumentException(
+                    'PipelineConfig: qualityMinCoveragePercent must be between 0 and 100, ' +
+                    'got ' + this.qualityMinCoveragePercent)
         }
     }
 

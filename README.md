@@ -119,6 +119,24 @@ circleguardPipeline(
 | `terraformApplyProdBranches` | `['main']` | Branch for the PROD target: PROD is only ever selected from `main` (any other branch, or a branch shared with DEV, fails the build). |
 | `terraformApplyProd` | `false` | PROD apply switch: **off**. Independent from `terraformApprovalProd`. |
 | `terraformApprovalProd` | `false` | PROD approval switch: **off**. Both PROD switches must be enabled explicitly. |
+| `zapScan` | `false` | Runs an **OWASP ZAP baseline scan** (spider + passive rules, no active attack) of the environment this build deployed. Requires `deploy: true`; gated additionally by `zapBranches` and `deployBranches`. |
+| `zapImage` | `ghcr.io/zaproxy/zaproxy:2.17.0` | Pinned image of the ZAP **tool** (`:bare`, `:stable`, `:latest` and `:weekly` are rejected). |
+| `zapTargets` | `[]` | URLs to scan. Empty means the Ingress base URL of `environment` (`k8sIngressUrls[environment]`), the same URL used by verification, smoke and E2E. |
+| `zapSpiderMinutes` | `1` | Minutes given to the traditional spider (`-m`). |
+| `zapMaxTimeMinutes` | `10` | ZAP ceiling for spider + passive scan (`-T`); without it ZAP waits forever. |
+| `zapDelaySeconds` | `0` | Delay before the passive scan (`-D`). |
+| `zapClientSpider` | `false` | Enables the JavaScript spider (`-j`); off in this phase (the XHR calls of the SPA are therefore not crawled). |
+| `zapTimeout` | `15` | Jenkins budget of the stage; **must be greater** than `zapMaxTimeMinutes` so the timeout cannot kill the scan in the middle. |
+| `zapBranches` | `['dev']` | Branches that may run the scan. The stage requires the flag **and** the branch (PRs never scan). |
+| `zapBlockSeverities` | `['High', 'Critical']` | Severities that **fail** the build (ZAP's top level is High; Critical is kept for a uniform policy across tools). |
+| `zapWarnSeverities` | `['Medium']` | Severities that mark the build **unstable** without failing it. |
+| `zapExceptionsFile` | `.zapignore.yaml` | Justified exceptions, read only when present. Each entry needs `id`, a justification and a future `expired_at`; a missing/expired date fails closed. |
+| `zapReportsPrefix` | `zap-report` | Prefix of the per-target HTML/JSON/XML/Markdown reports: `<prefix>-<build>-<target-slug>.<ext>`. |
+| `zapSummaryPrefix` | `zap-summary` | Prefix of the text summary and the synthetic JUnit file: `<prefix>-<build>.{txt,xml}`. |
+| `qualityReport` | `true` | Publishes the consolidated, **informational** coverage & quality report from `post { always }`. It never changes the result of the build. |
+| `qualityReportsPrefix` | `quality-report` | Prefix of the Markdown and HTML report files: `<prefix>-<build>.{md,html}`. |
+| `qualityMinCoveragePercent` | `60` | Threshold shown per gated service; mirrors the `jacocoTestCoverageVerification` rule of the application. |
+| `qualityGatedServices` | five core services | Services to which that threshold is applied in the report (the gate itself is enforced by Gradle). |
 
 **Kubernetes credentials.** The deploy and promotion stages need two Jenkins
 credentials: `kubeconfigCredentialId`, a **Secret file** (`dev-kubeconfig`,
@@ -188,6 +206,7 @@ token-minter bootstrap credential; it is not implemented here.
 | Publish images | `docker build` + `docker push` of every image (if `publish` and branch in `publishBranches`); each image is scanned with Trivy **between the build and the push** when `trivyImageScan` is enabled |
 | Deploy | Renders a temporary **application** overlay with the nine images pinned to `env.IMAGE_VERSION`, rejects any render outside the `circleguard` app scope before archiving, applies it with `kubectl --context ... --namespace ... apply -k` (no prune), checks all rollouts and archives the validated manifest (if `deploy` and branch in `deployBranches`) |
 | Verify deployment | HTTP checks of the six Ingress paths with retries; a `404` always fails the build (if `deploy`) |
+| OWASP ZAP security scan | Passive baseline scan of the Ingress URL this build just deployed; High/Critical findings fail and Medium marks the build unstable, **after** all evidence is published (if `zapScan`, `zapBranches`, `deploy` and `deployBranches`) |
 | Smoke tests | Functional HTTP checks against the Ingress base URL, with a JUnit report (if `deploy` and `smokeTests`) |
 | E2E tests | Playwright tests in a container against the same Ingress base URL used by verification; `results.xml`, `playwright-report/` and `test-results/` are cleaned before the run, a failed cleanup stops the stage **before** Playwright, JUnit and archiving, and a missing or empty new `results.xml` fails the stage (condition to promote, if `e2e`) |
 | Promote to stage | Deploys the **same version** to `stage` and verifies it; manual `input` only if `stageApproval` |
@@ -775,3 +794,129 @@ never fails the build. The disk before and after is printed in the log.
 
 At the end of PR and feature branch builds the workspace is deleted (`deleteDir()`); `dev` and `main` keep
 theirs so the next build is faster.
+
+## OWASP ZAP baseline scan
+
+`zapBaselineScan()` runs the **official, pinned** `ghcr.io/zaproxy/zaproxy:2.17.0`
+image (never `:latest`, `:weekly`, `:stable` or `:bare`) against the environment
+that **this build just deployed**. With no explicit `zapTargets` the target is
+`k8sIngressUrls[environment]` — the same URL that `verifyIngress`, `smokeTests`
+and `runE2E` use — so the scan can never point at a different deployment. It is
+off by default (`zapScan: false`) and requires `deploy: true` plus a branch in
+both `zapBranches` and `deployBranches`.
+
+The stage sits **between Verify deployment and Smoke tests**: the target is
+known to answer before the scan starts, and a blocking finding stops the build
+before the slower functional, E2E and promotion stages run.
+
+**What baseline is.** A traditional spider plus ZAP's **passive** rules: it
+crawls and inspects responses (missing security headers, weak cookies, CORS
+mistakes, information disclosure, answered-401 surfaces), but it **never
+attacks**. It does not detect SQL injection or reflected XSS, the traditional
+spider does not execute JavaScript (the SPA's XHR calls are invisible unless
+`zapClientSpider: true`), and without an OpenAPI definition the POST endpoints
+are not discovered. ZAP has no `Critical` severity (its maximum is `High`); the
+`Critical` bucket exists only to keep one policy across Trivy and future tools.
+
+### Container and evidence
+
+The workspace is mounted at **`/zap/wrk`**, which is the `base_dir` the packaged
+`zap-baseline.py` uses in Docker; reports therefore land in the workspace and
+are archived instead of disappearing in an anonymous container layer. The
+command carries `-T` (otherwise ZAP waits forever), but deliberately **no `-p`**
+(the unauthenticated ZAP API stays inside the container), **no `-c`** (the
+policy is applied to the JSON, not to hundreds of rule IDs) and **no `-I`** (it
+only silences exit 2). `-j` is opt-in. Targets are shell-quoted, so a URL with
+`&`, `?` or `#` stays one argument.
+
+Every artefact is named with the build number **and** the target slug
+(`zap-report-<build>-<slug>.{html,json,xml,md}`), the previous files of this
+build are removed with `rm -f` first, and everything is archived and published
+as HTML (`OWASP ZAP`) **before** any `error()`/`unstable()`. A synthetic JUnit
+file (`zap-summary-<build>.xml`) puts the findings in the Tests tab without any
+additional plugin, and a human-readable `zap-summary-<build>.txt` records the
+per-target breakdown, the aggregated counts and the final status.
+
+### Severity gate (why the JSON, not the exit code)
+
+ZAP's exit codes mean "the `-c` ruleset produced WARN/FAIL", not "this project's
+policy was violated": **0/1/2 are all valid results** and the severity gate is
+read from `site[].alerts[].riskcode` of the Traditional JSON report. Exit **3**,
+a missing/unparseable JSON report, an empty `site[]` or an alert with a
+`riskcode` outside `0..4` is a **TECHNICAL FAILURE** (`error` with that prefix),
+never a clean scan with zero findings. There is a pre-flight `curl` per target
+before the container starts for the same reason: an unreachable objective is a
+technical failure, not an empty result.
+
+| Severity | `riskcode` | Default outcome |
+|----------|-----------|-----------------|
+| Informational / Low | `0` / `1` | counted, never blocks |
+| Medium | `2` | `unstable()` (warning) |
+| High / Critical | `3` / `4` | `error()` after the evidence is archived |
+
+The decision is **aggregated across all targets**: one High on any target
+blocks the whole build.
+
+### Justified exceptions
+
+Exceptions live in `.zapignore.yaml` at the workspace root (only read when the
+file exists), mirroring `.trivyignore.yaml`:
+
+```yaml
+exceptions:
+  - id: "10015"
+    scope: "https://host/path/.*"   # optional regex over the alert URL
+    statement: >-
+      Why this finding is accepted, with evidence and the accepted risk.
+    approved_by: reviewer
+    expired_at: 2027-05-17          # required, must be a valid future date
+```
+
+An exception applies only when the `id` matches the ZAP plugin ID, the optional
+`scope` matches the URL and `expired_at` is a valid date that has not passed.
+An unparseable file, a missing/invalid/past date or a broken scope **fails
+closed**: the finding blocks again and the exception is reported as expired or
+unusable. Exceptions change only the decision, never the reports, so a
+suppressed finding remains visible in the archived HTML/JSON.
+
+### Known limitations and follow-ups
+
+- The scan is passive and anonymous; authenticated/protected endpoints answer
+  401 and their surface is outside this baseline.
+- No active scan, no JavaScript spider by default and no OpenAPI import: adding
+  those is a deliberate next phase, with its own authorisation and time budget.
+- The first run downloads a ~1.5 GB image; the pinned tag keeps later runs
+  reproducible.
+- The tests need `groovy-json` on the classpath (for `JsonSlurper`) in addition
+  to `groovy` — see `test/README.md`.
+
+## Consolidated coverage & quality report
+
+`qualityReport()` (E2.7) publishes **one** Markdown + HTML artefact that gathers
+the evidence this build already produced, instead of making the reader open
+five tabs. It is **informational**: it never fails the build, never marks it
+unstable and never changes its result. It runs from `post { always }`, after
+`publishTestReports()` and before `dockerCleanup()`/`deleteDir()`, so it also
+reports what was produced when an earlier stage failed. The whole body is
+guarded, because a throw inside `post { always }` would skip the cleanup that
+follows it.
+
+| Source | File read | Shown as |
+|--------|-----------|----------|
+| JaCoCo | `services/<service>/build/reports/jacoco/test/jacocoTestReport.xml` | line coverage per service + monorepo total, with the `qualityMinCoveragePercent` state of the services in `qualityGatedServices` |
+| JUnit | `services/<service>/build/test-results/{test,integrationTest}/*.xml` | tests / failures / errors / skipped per service and kind |
+| SonarQube | `sonar-quality-gate.txt` (written by `sonarAnalysis`) | the quality gate status |
+| Trivy | `trivy-iac-report-<build>*.txt`, `trivy-image-report-<build>*.txt` | severity counts from each report's own summary, or "not interpretable" if it has none |
+| OWASP ZAP | `zap-summary-<build>.txt` (written by `zapBaselineScan`) | per-severity totals and `PASS`/`WARN`/`BLOCK` status |
+
+The report also has an explicit **limitations** section (what baseline ZAP does
+not cover). Staleness is handled like everywhere else in the library: Trivy and
+ZAP artefacts are matched **by build number**, while JaCoCo/JUnit files have no
+build number in their name, so their modification time is compared with the
+start of this build and older files are labelled as coming from a previous
+build instead of being summed silently. Unreadable files are listed, never
+guessed.
+
+The output is `<prefix>-<build>.md` and `<prefix>-<build>.html` (default prefix
+`quality-report`), archived and published with the htmlpublisher plugin under
+the name `Coverage & Quality`.

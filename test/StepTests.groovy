@@ -194,8 +194,10 @@ def newStep = { String name, Map opts = [:] ->
         withEnv : [],
         withCredentials: [],
         junit   : [],
+        unstable: [],        // messages passed to the unstable() step
+        publishedHtml: [],   // maps passed to publishHTML
         inputs  : [],        // maps passed to the stubbed input step
-        currentBuild: [description: ''],
+        currentBuild: [description: '', time: opts.buildTime ?: 0],
         shellOutputs: [],
         shellCodes: [],
         deployKubernetesParams: [],
@@ -302,8 +304,15 @@ def newStep = { String name, Map opts = [:] ->
     def validate = validateTemplate.newInstance()
     validate.binding = binding
     binding.setVariable('terraformValidate', validate)
-    binding.setVariable('fileExists', { Object p -> !(opts.missing ?: []).contains(p) })
-    binding.setVariable('readFile', { Object p -> (opts.files ?: [:])[p] ?: "REPORT:${p}" })
+    // GString and String keys must compare by value: the steps interpolate their
+    // file names (GString) while the tests declare them as String constants.
+    binding.setVariable('fileExists', { Object p ->
+        !(opts.missing ?: []).collect { it.toString() }.contains(p.toString())
+    })
+    binding.setVariable('readFile', { Object p ->
+        def found = (opts.files ?: [:]).find { it.key.toString() == p.toString() }
+        return found ? (found.value ?: "REPORT:${p}") : "REPORT:${p}"
+    })
     // writeFile records what the step wrote (sidecars, evidence, markers) and can
     // be made to fail for one file (opts.failWriteFileContains).
     binding.setVariable('writeFile', { Object a ->
@@ -327,6 +336,12 @@ def newStep = { String name, Map opts = [:] ->
     binding.setVariable('junit', { Object a ->
         b.junit << (a instanceof Map ? a.testResults : a.toString())
     })
+    // unstable(): the warning-level outcome (never a failure). Recorded so the
+    // tests can tell "warned" from "blocked" and from "silent".
+    binding.setVariable('unstable', { Object m -> b.unstable << m.toString() })
+    // publishHTML(): the htmlpublisher plugin (installed, used by the ZAP and
+    // the consolidated quality report).
+    binding.setVariable('publishHTML', { Object a -> b.publishedHtml << a })
     // input: records every call (message, ok, submitter, submitterParameter,
     // timeout, timeUnit) and returns opts.inputResult ('admin' by default);
     // opts.failInput throws, simulating an expired or cancelled approval.
@@ -373,6 +388,7 @@ def newStep = { String name, Map opts = [:] ->
 
      [script: script, sh: b.sh, logs: b.logs, archived: b.archived, written: b.written,
       env: b.env, withEnv: b.withEnv, withCredentials: b.withCredentials, junit: b.junit,
+      unstable: b.unstable, publishedHtml: b.publishedHtml,
       inputs: b.inputs, trace: b.trace, currentBuild: b.currentBuild,
       deployKubernetesParams: b.deployKubernetesParams,
       shellOutputs: b.shellOutputs, shellCodes: b.shellCodes]
@@ -4688,6 +4704,569 @@ test('documents the terraform apply step in the READMEs') {
     String testReadme = new File(root, 'test/README.md').text
     assert testReadme.contains('| `terraformApply` |'): 'the step must be covered'
     assert testReadme.contains('| `terraformPlan` |'): 'the plan row must be updated'
+}
+
+println 'zapBaselineScan (OWASP ZAP baseline)'
+String ZAP_TARGET = 'http://10.20.1.230/'
+String ZAP_SLUG = 'http-10-20-1-230'
+String ZAP_JSON = "zap-report-42-${ZAP_SLUG}.json"
+String ZAP_HTML = "zap-report-42-${ZAP_SLUG}.html"
+String ZAP_XML = "zap-report-42-${ZAP_SLUG}.xml"
+String ZAP_MD = "zap-report-42-${ZAP_SLUG}.md"
+
+// Only plain values are injected: JsonSlurper's LazyMap/LazyList must never be
+// handed back to the CPS-transformed step.
+def zapJson = { List<Map> alerts ->
+    groovy.json.JsonOutput.toJson([site: [[site: ZAP_TARGET, alerts: alerts]]])
+}
+def zapAlert = { String risk, String plugin = '10015',
+                 String url = ZAP_TARGET, String name = 'Missing security header' ->
+    [pluginid: plugin, alert: name, riskcode: risk, url: url]
+}
+// Default: the pre-flight answers 200 and ZAP exits 0 with a clean report.
+def zapOpts = { List<Map> alerts, Map extra = [:] ->
+    Map o = [stdout: '200', missing: ['.zapignore.yaml'],
+             files: [(ZAP_JSON): zapJson(alerts)]]
+    o.putAll(extra)
+    return o
+}
+
+test('runs the pinned image against the deployed target with /zap/wrk mounted') {
+    def h = newStep('zapBaselineScan', zapOpts([]))
+    Map result = h.script.call(targets: [ZAP_TARGET]) as Map
+
+    assert h.sh.size() == 3: h.sh
+    assert h.sh[0].startsWith('rm -f '): h.sh[0]
+    assert h.sh[1].contains('curl -s -o /dev/null'): h.sh[1]
+    assert h.sh[1].contains("'${ZAP_TARGET}'"): h.sh[1]
+
+    String cmd = h.sh[2]
+    assert cmd.contains('docker run --rm')
+    assert cmd.contains('--mount \'type=volume,source=circleguard-jenkins-home,' +
+                        'destination=/zap/wrk,volume-subpath=workspace/circleguard_dev\''): cmd
+    assert cmd.contains("-w '/zap/wrk'"): 'the base_dir of zap-baseline.py is /zap/wrk'
+    assert !cmd.contains('/var/jenkins_home'): 'no host path may reach the container'
+    assert cmd.contains('ghcr.io/zaproxy/zaproxy:2.17.0 zap-baseline.py'): cmd
+    assert cmd.contains("-t '${ZAP_TARGET}'"): cmd
+    assert cmd.contains('-m 1 -T 10 -D 0'): cmd
+    assert cmd.contains("-r ${ZAP_HTML} -J ${ZAP_JSON} -x ${ZAP_XML} -w ${ZAP_MD}"): cmd
+    // No -p: publishing the unauthenticated ZAP API would expose it; no -c:
+    // the severity policy is applied to the JSON; no -I: it only hides exit 2.
+    List<String> tokens = tokenizeShell(cmd)
+    ['-p', '-c', '-I', '-j'].each { String flag ->
+        assert !tokens.contains(flag): "unexpected ${flag} in ${cmd}"
+    }
+    assert result.status == 'PASS': result
+    assert result.counts == [Informational: 0, Low: 0, Medium: 0, High: 0, Critical: 0]
+    assert result.reports.collect { it.toString() }.contains(ZAP_HTML.toString()): result.reports
+    assert h.publishedHtml.size() == 1
+    assert h.publishedHtml[0].target.reportName == 'OWASP ZAP'
+    assert h.junit == ['zap-summary-42.xml']
+    assert h.unstable.isEmpty()
+}
+
+test('shell-quotes the target and enables the client spider only when requested') {
+    String tricky = 'http://10.20.1.230/path?a=1&b=2#frag'
+    String slug = newStep('zapBaselineScan').script.slugFor(tricky)
+    String json = "zap-report-42-${slug}.json"
+    def h = newStep('zapBaselineScan', zapOpts([], [files: [(json): zapJson([])]]))
+    h.script.call(targets: [tricky], clientSpider: true)
+
+    String cmd = h.sh.find { it.contains('zap-baseline.py') }
+    assert cmd.contains("'${tricky}'"): 'a URL with & and # must stay one shell word'
+    assert tokenizeShell(cmd).contains(tricky): cmd
+    assert tokenizeShell(cmd).contains('-j'): 'the JavaScript spider is opt-in'
+}
+
+test('removes and archives only the evidence of this build') {
+    String oldJson = ZAP_JSON.replace('-42-', '-41-')
+    def h = newStep('zapBaselineScan',
+                    zapOpts([], [files: [(ZAP_JSON): zapJson([]), (oldJson): 'OLD']]))
+    h.script.call(targets: [ZAP_TARGET])
+
+    assert h.sh[0].contains(ZAP_JSON): h.sh[0]
+    assert h.sh[0].contains('zap-summary-42.txt'): h.sh[0]
+    assert !h.sh[0].contains(oldJson): 'a previous build report must not be removed or archived'
+    assert h.archived.size() == 2: h.archived
+    assert h.archived.every { !it.contains('-41-') }: h.archived
+}
+
+test('a High finding blocks, but only after all the evidence is archived') {
+    def h = newStep('zapBaselineScan', zapOpts([zapAlert('3')]))
+    try {
+        h.script.call(targets: [ZAP_TARGET])
+        assert false: 'a High finding must block the build'
+    } catch (RuntimeException e) {
+        assert e.message.contains('BLOCKED by High'): e.message
+        assert e.message.contains('.zapignore.yaml'): 'the exception path must be explained'
+    }
+    assert h.archived.size() == 2: h.archived
+    assert h.archived[0].contains(ZAP_HTML): 'the reports must survive the failure'
+    assert h.archived[1].contains('zap-summary-42.txt'): 'the summary must survive the failure'
+    assert h.publishedHtml.size() == 1
+    assert h.junit.size() == 1
+    assert h.unstable.isEmpty(): 'blocking is an error, not an unstable build'
+    assert h.written['zap-summary-42.txt'].contains('status:     BLOCK')
+    assert h.written['zap-summary-42.xml'].contains('<failure message=')
+}
+
+test('a Medium finding marks the build unstable without failing it') {
+    def h = newStep('zapBaselineScan', zapOpts([zapAlert('2')]))
+    Map result = h.script.call(targets: [ZAP_TARGET]) as Map
+    assert result.status == 'WARN': result
+    assert h.unstable.size() == 1: h.unstable
+    assert h.unstable[0].contains('Medium'): h.unstable
+    assert h.written['zap-summary-42.txt'].contains('status:     WARN')
+}
+
+test('exit codes 0, 1 and 2 are results; the severity always comes from the JSON') {
+    [0, 1, 2].each { int exit ->
+        def clean = newStep('zapBaselineScan', zapOpts([], [status: exit]))
+        assert (clean.script.call(targets: [ZAP_TARGET]) as Map).status == 'PASS':
+            "exit ${exit} must be a valid clean result"
+
+        def high = newStep('zapBaselineScan', zapOpts([zapAlert('3')], [status: exit]))
+        try {
+            high.script.call(targets: [ZAP_TARGET])
+            assert false: "exit ${exit} must still block on a High finding"
+        } catch (RuntimeException e) {
+            assert e.message.contains('BLOCKED by High'): e.message
+        }
+    }
+}
+
+test('exit 3, a missing or empty report and an unknown riskcode are technical failures') {
+    def assertTechnical = { Map opts, String detail ->
+        def h = newStep('zapBaselineScan', opts)
+        try {
+            h.script.call(targets: [ZAP_TARGET])
+            assert false: "a technical failure must abort the step (${detail})"
+        } catch (RuntimeException e) {
+            assert e.message.contains('TECHNICAL FAILURE'): e.message
+            assert e.message.contains('NOT a security finding'): e.message
+            assert e.message.contains(detail): e.message
+        }
+        assert h.unstable.isEmpty()
+    }
+
+    assertTechnical(zapOpts([], [status: 3, missing: [ZAP_JSON]]), 'no JSON report')
+    assertTechnical(zapOpts([], [status: 3, files: [(ZAP_JSON): '{"site":[]}']]),
+                    'nothing was crawled')
+    assertTechnical(zapOpts([], [files: [(ZAP_JSON): '{oops']]),
+                    'could not be parsed')
+    assertTechnical(zapOpts([], [files: [(ZAP_JSON): zapJson([zapAlert('9')])]]),
+                    "riskcode='9'")
+}
+
+test('a current exception suppresses a finding; expired or incomplete ones do not') {
+    String validUntil = java.time.LocalDate.now().plusDays(30).toString()
+    String expiredUntil = java.time.LocalDate.now().minusDays(30).toString()
+    def ignore = { String expires ->
+        '''exceptions:
+  - id: "10015"
+    scope: "http://10\\.20\\.1\\.230/.*"
+    statement: >-
+      Documented and accepted for this test.
+    approved_by: reviewer
+    expired_at: ''' + expires + '\n'
+    }
+
+    Map validOpts = zapOpts([zapAlert('3')],
+            [missing: [], files: [(ZAP_JSON): zapJson([zapAlert('3')]),
+                                  '.zapignore.yaml': ignore(validUntil)]])
+    def accepted = newStep('zapBaselineScan', validOpts)
+    Map acceptedResult = accepted.script.call(targets: [ZAP_TARGET]) as Map
+    assert acceptedResult.status == 'PASS': acceptedResult
+    assert acceptedResult.excepted == 1: acceptedResult
+    assert accepted.unstable.isEmpty()
+    assert accepted.written['zap-summary-42.txt'].contains('excepted findings')
+
+    Map expiredOpts = zapOpts([zapAlert('3')],
+            [missing: [], files: [(ZAP_JSON): zapJson([zapAlert('3')]),
+                                  '.zapignore.yaml': ignore(expiredUntil)]])
+    def expired = newStep('zapBaselineScan', expiredOpts)
+    Map expiredResult
+    try {
+        expiredResult = expired.script.call(targets: [ZAP_TARGET]) as Map
+        assert false: 'an expired exception must not suppress a High finding'
+    } catch (RuntimeException e) {
+        assert e.message.contains('BLOCKED by High'): e.message
+    }
+    assert expired.written['zap-summary-42.txt'].contains('1 expired exception(s)')
+
+    String noDate = '''exceptions:
+  - id: "10015"
+    statement: "no accountable end date"
+'''
+    def invalid = newStep('zapBaselineScan', zapOpts([zapAlert('3')],
+            [missing: [], files: [(ZAP_JSON): zapJson([zapAlert('3')]),
+                                  '.zapignore.yaml': noDate]]))
+    try {
+        invalid.script.call(targets: [ZAP_TARGET])
+        assert false: 'an exception without expired_at must fail closed'
+    } catch (RuntimeException e) {
+        assert e.message.contains('BLOCKED by High'): e.message
+    }
+
+    String otherScope = ignore(validUntil).replace('10\\.20\\.1\\.230', '10\\.20\\.1\\.999')
+    def outOfScope = newStep('zapBaselineScan', zapOpts([zapAlert('3')],
+            [missing: [], files: [(ZAP_JSON): zapJson([zapAlert('3')]),
+                                  '.zapignore.yaml': otherScope]]))
+    try {
+        outOfScope.script.call(targets: [ZAP_TARGET])
+        assert false: 'a scope that does not match must not suppress anything'
+    } catch (RuntimeException e) {
+        assert e.message.contains('BLOCKED by High'): e.message
+    }
+}
+
+test('a High on ANY target blocks the single aggregated decision') {
+    String second = 'http://10.20.1.231/'
+    String slug2 = newStep('zapBaselineScan').script.slugFor(second)
+    String json2 = "zap-report-42-${slug2}.json"
+    Map opts = [stdout: '200', missing: ['.zapignore.yaml'],
+                files: [(ZAP_JSON): zapJson([]),
+                        (json2): groovy.json.JsonOutput.toJson(
+                            [site: [[site: second,
+                                     alerts: [zapAlert('3', '10016', second)]]]])]]
+    def h = newStep('zapBaselineScan', opts)
+    try {
+        h.script.call(targets: [ZAP_TARGET, second])
+        assert false: 'one High finding must block all targets'
+    } catch (RuntimeException e) {
+        assert e.message.contains('BLOCKED by High'): e.message
+    }
+    assert h.sh.findAll { it.contains('curl -s -o /dev/null') }.size() == 2
+    assert h.sh.findAll { it.contains('zap-baseline.py') }.size() == 2
+    assert h.sh[0].contains(json2): 'both targets share the rm of this build'
+    String summary = h.written['zap-summary-42.txt']
+    assert summary.contains(ZAP_TARGET) && summary.contains(second): summary
+    assert summary.contains('High: 1'): summary
+}
+
+test('rejects unsafe input before starting any container') {
+    def cases = [
+        [{ newStep('zapBaselineScan').script.call() }, 'at least one target URL is required'],
+        [{ newStep('zapBaselineScan').script.call(targets: ['http://x; rm -rf /']) },
+         'invalid target URL'],
+        [{ newStep('zapBaselineScan').script.call(targets: [ZAP_TARGET],
+                                                 image: 'ghcr.io/zaproxy/zaproxy:latest') },
+         'pinned'],
+        [{ newStep('zapBaselineScan').script.call(targets: [ZAP_TARGET], timeout: 10) },
+         'must be GREATER'],
+        [{ newStep('zapBaselineScan').script.call(targets: [ZAP_TARGET],
+                                                 reportsPrefix: '../evil') },
+         'plain file name'],
+        [{ newStep('zapBaselineScan').script.call(targets: [ZAP_TARGET],
+                                                 blockSeverities: ['Bogus']) },
+         'unknown severity'],
+        [{ newStep('zapBaselineScan', [env: [WORKSPACE: '/var/jenkins_home/secrets',
+                                            BUILD_NUMBER: '42']]).script
+                .call(targets: [ZAP_TARGET]) }, 'not under /var/jenkins_home/workspace'],
+        [{ newStep('zapBaselineScan', [env: [WORKSPACE: '/var/jenkins_home/workspace/ghost',
+                                            BUILD_NUMBER: '42'], missing: [
+                                                '/var/jenkins_home/workspace/ghost']]).script
+                .call(targets: [ZAP_TARGET]) }, 'does not exist yet']
+    ]
+    cases.each { Closure call, String detail ->
+        try {
+            call()
+            assert false: "expected rejection containing '${detail}'"
+        } catch (RuntimeException e) {
+            assert e.message.contains(detail): "${detail} != ${e.message}"
+        }
+    }
+    assert newStep('zapBaselineScan').sh.isEmpty(): 'no container may start on bad input'
+}
+
+test('writes a human summary and a synthetic JUnit report for the Tests tab') {
+    def h = newStep('zapBaselineScan', zapOpts([zapAlert('2'), zapAlert('3')]))
+    try {
+        h.script.call(targets: [ZAP_TARGET])
+        assert false
+    } catch (RuntimeException ignored) { /* the High finding blocks */ }
+
+    String summary = h.written['zap-summary-42.txt']
+    assert summary.contains('CircleGuard - OWASP ZAP baseline scan')
+    assert summary.contains('mode:       baseline (spider + passive rules, no active attack)')
+    assert summary.contains('Informational: 0  Low: 0  Medium: 1  High: 1  Critical: 0')
+    assert summary.contains('status:     BLOCK')
+
+    String junitXml = h.written['zap-summary-42.xml']
+    assert junitXml.contains('testsuite name="owasp-zap" tests="3" failures="2"')
+    assert junitXml.contains('name="baseline scan completed (BLOCK)"')
+    assert junitXml.contains('name="Medium: 1 finding(s)"')
+    assert junitXml.contains('name="High: 1 finding(s)"')
+    assert h.junit == ['zap-summary-42.xml']
+}
+
+println 'qualityReport (consolidated coverage & quality)'
+String JACOCO_PATH = 'services/auth/build/reports/jacoco/test/jacocoTestReport.xml'
+String JUNIT_PATH = 'services/auth/build/test-results/test/TEST-auth.xml'
+String IT_PATH = 'services/auth/build/test-results/integrationTest/TEST-auth-it.xml'
+String JACOCO_XML = '''<?xml version="1.0"?><report name="auth">
+<package name="pkg"><counter type="LINE" missed="9" covered="1"/></package>
+<counter type="INSTRUCTION" missed="0" covered="1"/>
+<counter type="LINE" missed="10" covered="90"/></report>'''
+String JUNIT_XML = '<testsuite name="auth" tests="12" failures="1" errors="0" skipped="2"/>'
+String IT_XML = '<testsuite name="auth-it" tests="4" failures="0" errors="0" skipped="0"/>'
+String TRIVY_IAC = 'trivy-iac-report-42-main.tf.txt'
+String TRIVY_IMG = 'trivy-image-report-42-auth.txt'
+String MANIFEST = [
+    "JACOCO|${JACOCO_PATH}|1700000000",
+    "UNIT|${JUNIT_PATH}|1700000000",
+    "IT|${IT_PATH}|1700000000",
+    "TRIVY_IAC|${TRIVY_IAC}|1700000000",
+    "TRIVY_IMG|${TRIVY_IMG}|1700000000",
+    'ZAP_SUMMARY|zap-summary-42.txt|1700000000',
+    'SONAR|sonar-quality-gate.txt|1700000000'
+].join('\n')
+Map Q_FILES = [
+    (JACOCO_PATH): JACOCO_XML,
+    (JUNIT_PATH): JUNIT_XML,
+    (IT_PATH): IT_XML,
+    (TRIVY_IAC): 'noise\nTotal: 2\nCRITICAL: 0 HIGH: 1 MEDIUM: 1 LOW: 0 UNKNOWN: 0',
+    (TRIVY_IMG): 'Total: 1\nCRITICAL: 0 HIGH: 0 MEDIUM: 0 LOW: 1 UNKNOWN: 0',
+    'zap-summary-42.txt': 'totals: Informational: 0  Low: 0  Medium: 1  High: 0  ' +
+                          'Critical: 0\nfindings: 1 total, 0 excepted\nstatus: WARN',
+    'sonar-quality-gate.txt': 'status=OK'
+]
+
+test('merges JaCoCo, JUnit, Sonar, Trivy and ZAP into one Markdown + HTML report') {
+    def h = newStep('qualityReport', [stdout: MANIFEST, files: Q_FILES])
+    assert h.script.call(environment: 'dev') == null: 'the report is informational'
+
+    assert h.sh.size() == 1: 'a single manifest call, no per-file shell calls'
+    assert h.sh[0].contains('set +x'): h.sh[0]
+    assert h.sh[0].contains('zap-summary-42.txt'): h.sh[0]
+    assert h.sh[0].contains('sonar-quality-gate.txt'): h.sh[0]
+
+    String md = h.written['quality-report-42.md']
+    assert md.contains('# Informe consolidado de cobertura y calidad')
+    assert md.contains('environment dev')
+    assert md.contains('## 1. Cobertura de líneas (JaCoCo)')
+    assert md.contains('| auth | 90 | 100 | 90 % | sin gate |'): md
+    assert md.contains('Total del monorepo: 90 de 100 líneas (90 %).'): md
+    assert md.contains('## 2. Pruebas automatizadas')
+    assert md.contains('| auth | unit | 12 | 1 | 0 | 2 |'): md
+    assert md.contains('| auth | integration | 4 | 0 | 0 | 0 |'): md
+    assert md.contains('Total: 16 tests, 1 fallas, 0 errores, 2 omitidos.'): md
+    assert md.contains('## 3. Análisis estático (SonarQube)')
+    assert md.contains('Quality gate: OK'): md
+    assert md.contains('## 4. Seguridad')
+    assert md.contains('Trivy IaC (Terraform)')
+    assert md.contains('HIGH: 1'): md
+    assert md.contains('OWASP ZAP baseline')
+    assert md.contains('estado WARN'): md
+    assert md.contains('## 5. Limitaciones declaradas')
+    assert md.contains('ZAP Baseline es pasivo'): md
+
+    String html = h.written['quality-report-42.html']
+    assert html.contains('<html lang="es">')
+    assert html.contains('<title>CircleGuard coverage &amp; quality - build 42</title>'): html.take(300)
+    assert html.contains('<h2>1. Cobertura de líneas (JaCoCo)</h2>')
+    assert html.contains('<table><thead><tr>')
+
+    assert h.archived == ['quality-report-42.md,quality-report-42.html']: h.archived
+    assert h.publishedHtml.size() == 1: h.publishedHtml
+    assert h.publishedHtml[0].target.reportName == 'Coverage & Quality'
+    assert h.unstable.isEmpty(): 'an informational report never changes the result'
+}
+
+test('excludes evidence older than this build instead of presenting it as current') {
+    def h = newStep('qualityReport', [buildTime: 1800000000000L,
+                                      stdout: MANIFEST, files: Q_FILES])
+    h.script.call()
+    String md = h.written['quality-report-42.md']
+    assert md.contains('Evidencia de una build anterior, excluida del consolidado:'): md
+    assert md.contains('auth (JaCoCo)') && md.contains('auth (unit tests)'): md
+    assert !md.contains('| auth | 90 | 100 |'): 'stale numbers must not be summed'
+    assert h.unstable.isEmpty()
+}
+
+test('shows the configured gate per core service without changing the result') {
+    Map lowFiles = new LinkedHashMap(Q_FILES)
+    lowFiles[JACOCO_PATH] = JACOCO_XML.replace('missed="10" covered="90"',
+                                               'missed="50" covered="50"')
+    def h = newStep('qualityReport', [stdout: MANIFEST, files: lowFiles])
+    h.script.call(gatedServices: ['auth'], minCoveragePercent: 60)
+    String md = h.written['quality-report-42.md']
+    assert md.contains('BAJO (gate >= 60 %)'): md
+    assert h.unstable.isEmpty()
+}
+
+test('handles empty and unreadable evidence without throwing') {
+    def empty = newStep('qualityReport', [stdout: ''])
+    empty.script.call()
+    String md = empty.written['quality-report-42.md']
+    assert md.contains('Sin informes de cobertura en este build'): md
+    assert md.contains('Sin resultados de pruebas en este build'): md
+    assert md.contains('Quality gate: no disponible'): md
+    assert md.contains('Sin escaneos de seguridad en este build'): md
+
+    def broken = newStep('qualityReport',
+            [stdout: "JACOCO|${JACOCO_PATH}|1700000000\nUNIT|${JUNIT_PATH}|1700000000",
+             files: [(JACOCO_PATH): 'garbage', (JUNIT_PATH): 'garbage']])
+    broken.script.call()
+    assert broken.written['quality-report-42.md']
+            .contains('Archivos presentes pero no interpretables:')
+}
+
+test('never breaks post { always }: invalid prefix and read errors are swallowed') {
+    def bad = newStep('qualityReport', [stdout: MANIFEST, files: Q_FILES])
+    assert bad.script.call(reportsPrefix: '../evil') == null
+    assert bad.written.isEmpty(): bad.written
+    assert bad.archived.isEmpty()
+
+    def boom = newStep('qualityReport', [stdout: MANIFEST, files: Q_FILES, failSh: true])
+    boom.script.call()   // must NOT throw
+    assert boom.written.isEmpty()
+    assert boom.logs.any { it.contains('could not be generated') }: boom.logs
+    assert boom.unstable.isEmpty()
+}
+
+println 'PipelineConfig and pipeline wiring (OWASP ZAP + quality report)'
+test('keeps ZAP opt-in with a pinned image and the report informational') {
+    def cfg = newConfig([:])
+    assert cfg.zapScan == false
+    assert cfg.zapImage == 'ghcr.io/zaproxy/zaproxy:2.17.0'
+    assert cfg.zapTargets.isEmpty()
+    assert cfg.zapSpiderMinutes == 1 && cfg.zapMaxTimeMinutes == 10
+    assert cfg.zapDelaySeconds == 0 && cfg.zapClientSpider == false
+    assert cfg.zapTimeout == 15
+    assert cfg.zapBranches == ['dev']
+    assert cfg.zapBlockSeverities == ['High', 'Critical']
+    assert cfg.zapWarnSeverities == ['Medium']
+    assert cfg.zapExceptionsFile == '.zapignore.yaml'
+    assert cfg.zapReportsPrefix == 'zap-report' && cfg.zapSummaryPrefix == 'zap-summary'
+    assert cfg.qualityReport == true: 'the report is informational and on by default'
+    assert cfg.qualityReportsPrefix == 'quality-report'
+    assert cfg.qualityMinCoveragePercent == 60
+    assert cfg.qualityGatedServices.contains('circleguard-auth-service')
+}
+
+test('accepts the ZAP and quality parameters from the Jenkinsfile') {
+    def cfg = newConfig([zapScan: true, deploy: true, environment: 'dev',
+                         k8sContext: 'cg-dev', k8sIngressUrls: [dev: 'http://dev.example'],
+                         zapTargets: [ZAP_TARGET], zapSpiderMinutes: 2,
+                         zapMaxTimeMinutes: 12, zapDelaySeconds: 1,
+                         zapClientSpider: true, zapTimeout: 20,
+                         zapBranches: ['dev'], zapBlockSeverities: ['High'],
+                         zapWarnSeverities: ['Low'],
+                         zapExceptionsFile: '.zap-exceptions.yaml',
+                         zapReportsPrefix: 'zapr', zapSummaryPrefix: 'zaps',
+                         qualityReport: false, qualityReportsPrefix: 'qa',
+                         qualityMinCoveragePercent: 70,
+                         qualityGatedServices: ['only-this']])
+    assert cfg.zapScan == true
+    assert cfg.zapTargets == [ZAP_TARGET]
+    assert cfg.zapSpiderMinutes == 2 && cfg.zapMaxTimeMinutes == 12
+    assert cfg.zapDelaySeconds == 1 && cfg.zapClientSpider == true
+    assert cfg.zapTimeout == 20
+    assert cfg.zapBlockSeverities == ['High'] && cfg.zapWarnSeverities == ['Low']
+    assert cfg.zapExceptionsFile == '.zap-exceptions.yaml'
+    assert cfg.zapReportsPrefix == 'zapr' && cfg.zapSummaryPrefix == 'zaps'
+    assert cfg.qualityReport == false
+    assert cfg.qualityReportsPrefix == 'qa'
+    assert cfg.qualityMinCoveragePercent == 70
+    assert cfg.qualityGatedServices == ['only-this']
+    assert cfg.zapImage == 'ghcr.io/zaproxy/zaproxy:2.17.0': 'the pinned default survives'
+}
+
+test('rejects a ZAP configuration that could never produce a meaningful result') {
+    def rejections = [
+        [[zapScan: true], 'zapScan requires deploy=true'],
+        [[zapTimeout: 10], 'must be GREATER'],
+        [[zapMaxTimeMinutes: 0], 'zapMaxTimeMinutes must be > 0'],
+        [[zapImage: 'ghcr.io/zaproxy/zaproxy:latest'], 'must be pinned'],
+        [[zapTargets: ['file:///etc/passwd']], 'plain http/https URLs only'],
+        [[zapReportsPrefix: '../evil'], 'plain file name'],
+        [[qualityReportsPrefix: 'has space'], 'plain file name'],
+        [[qualityMinCoveragePercent: 101], 'between 0 and 100']
+    ]
+    rejections.each { Map bad, String detail ->
+        try {
+            newConfig(bad)
+            assert false: "expected rejection containing '${detail}' for ${bad}"
+        } catch (IllegalArgumentException e) {
+            assert e.message.contains(detail): "${detail} != ${e.message}"
+        }
+    }
+}
+
+test('places the ZAP stage after Verify deployment and before Smoke tests') {
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+    int verify = text.indexOf("stage('Verify deployment')")
+    int zap = text.indexOf("stage('OWASP ZAP security scan')")
+    int smoke = text.indexOf("stage('Smoke tests')")
+    assert verify > 0 && zap > verify && smoke > zap:
+        "wrong order: verify=${verify} zap=${zap} smoke=${smoke}"
+
+    String stage = text.substring(zap, smoke)
+    assert stage.contains('cfg.zapScan && cfg.zapBranches.contains(env.BRANCH_NAME)'):
+        'the flag AND the branch are required'
+    assert stage.contains('cfg.deploy && cfg.deployBranches.contains(env.BRANCH_NAME)'):
+        'a deployment must exist before scanning it'
+    assert stage.contains('timeout(time: cfg.zapTimeout')
+    assert stage.contains('cfg.zapTargets ?')
+    assert stage.contains('k8sIngressUrl(cfg, cfg.environment)'):
+        'the default target is the Ingress URL of the deployed environment'
+    ['image: cfg.zapImage', 'spiderMinutes: cfg.zapSpiderMinutes',
+     'maxTimeMinutes: cfg.zapMaxTimeMinutes', 'delaySeconds: cfg.zapDelaySeconds',
+     'clientSpider: cfg.zapClientSpider', 'timeout: cfg.zapTimeout',
+     'blockSeverities: cfg.zapBlockSeverities', 'warnSeverities: cfg.zapWarnSeverities',
+     'exceptionsFile: cfg.zapExceptionsFile', 'reportsPrefix: cfg.zapReportsPrefix',
+     'summaryPrefix: cfg.zapSummaryPrefix'].each { String param ->
+        assert stage.contains(param): "ZAP parameter not passed: ${param}"
+    }
+    assert text.contains('Map zap = zapBaselineScan(')
+    assert text.contains('"ZAP ${zap.status}"'):
+        'the outcome must reach the build description'
+}
+
+test('renders the consolidated report from post always, after the test reports') {
+    String text = new File(root, 'vars/circleguardPipeline.groovy').text
+    int post = text.indexOf('post {')
+    int always = text.indexOf('always {', post)
+    int testReports = text.indexOf('publishTestReports()', always)
+    int quality = text.indexOf('qualityReport(', always)
+    assert post > 0 && always > post && testReports > always && quality > testReports:
+        "wrong order: post=${post} always=${always} tests=${testReports} quality=${quality}"
+    assert text.contains('if (cfg.qualityReport)')
+    ['reportsPrefix: cfg.qualityReportsPrefix', 'zapSummaryPrefix: cfg.zapSummaryPrefix',
+     'minCoveragePercent: cfg.qualityMinCoveragePercent',
+     'gatedServices: cfg.qualityGatedServices', 'environment: cfg.environment'
+    ].each { String param -> assert text.contains(param): "missing ${param}" }
+    int cleanup = text.indexOf('dockerCleanup()', always)
+    assert cleanup > quality: 'the report must run before the cleanup deletes the evidence'
+}
+
+test('the new steps compile together with the pipeline') {
+    def child = new GroovyClassLoader(loader)
+    child.parseClass(new File(root, 'src/org/circleguard/ci/PipelineConfig.groovy'))
+    child.parseClass(new File(root, 'vars/circleguardPipeline.groovy'))
+    child.parseClass(new File(root, 'vars/zapBaselineScan.groovy'))
+    child.parseClass(new File(root, 'vars/qualityReport.groovy'))
+    child.parseClass(new File(root, 'vars/runInContainer.groovy'))
+}
+
+test('documents ZAP and the consolidated report in both READMEs') {
+    String readme = new File(root, 'README.md').text
+    ['zapScan', 'zapImage', 'zapTargets', 'zapSpiderMinutes', 'zapMaxTimeMinutes',
+     'zapTimeout', 'zapBranches', 'zapBlockSeverities', 'zapWarnSeverities',
+     'zapExceptionsFile', 'qualityReport', 'qualityReportsPrefix',
+     'qualityMinCoveragePercent', 'qualityGatedServices'].each { String param ->
+        assert readme.contains('| `' + param + '` |'): "undocumented parameter: ${param}"
+    }
+    assert readme.contains('| OWASP ZAP security scan |'): 'the stage table must change'
+    assert readme.contains('## OWASP ZAP baseline scan'): 'the section must exist'
+    assert readme.contains('## Consolidated coverage & quality report')
+    assert readme.contains('groovy-json'): 'the new test dependency must be documented'
+
+    String testReadme = new File(root, 'test/README.md').text
+    assert testReadme.contains('| `zapBaselineScan` |'): 'the step must be covered'
+    assert testReadme.contains('| `qualityReport` |')
+    assert testReadme.contains('groovy-json'): 'the command must include the new jar'
 }
 
 println ''

@@ -22,7 +22,21 @@ def call(Map params = [:]) {
                 -Dsonar.token="$SONAR_AUTH_TOKEN"'''
         }
     }
+    // The gate result is PERSISTED so the consolidated coverage & quality report
+    // (qualityReport) can show it. abortPipeline: true would throw before the
+    // file could be written, so the gate is fetched without aborting and the
+    // build is failed here instead: the blocking behaviour is identical and the
+    // evidence survives it.
+    Map gate = [:]
     timeout(time: 10, unit: 'MINUTES') {
-        waitForQualityGate abortPipeline: true
+        gate = waitForQualityGate abortPipeline: false
     }
+    String status = (gate?.status ?: 'UNKNOWN').toString()
+    writeFile file: 'sonar-quality-gate.txt',
+              text: "status=${status}\nproject=${projectKey}\nserver=${server}\n"
+    if (status != 'OK') {
+        error "sonarAnalysis: SonarQube quality gate ${status} for project " +
+              "${projectKey}: the build is blocked until the gate passes"
+    }
+    echo "sonarAnalysis: quality gate OK for ${projectKey}"
 }
