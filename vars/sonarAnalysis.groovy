@@ -27,7 +27,8 @@ def call(Map params = [:]) {
     // file could be written, so the gate is fetched without aborting and the
     // build is failed here instead: the blocking behaviour is identical and the
     // evidence survives it.
-    Map gate = [:]
+    // waitForQualityGate returns the plugin's QGStatus object (with a status property), not a Map
+    def gate = null
     timeout(time: 10, unit: 'MINUTES') {
         gate = waitForQualityGate abortPipeline: false
     }
