@@ -119,7 +119,7 @@ if awk -v user="\${K8S_KUBECONFIG_USER}" '\$0 == "- name: " user { found = 1 } E
 fi
 awk 'BEGIN { u = ENVIRON["K8S_KUBECONFIG_USER"]; t = ENVIRON["K8S_TOKEN"] } /^users:/ { seen = 1; print "users:"; printf "- name: %s\\n  user:\\n    token: \\"%s\\"\\n", u, t; next } { print } END { if (!seen) { print "users:"; printf "- name: %s\\n  user:\\n    token: \\"%s\\"\\n", u, t } }' "\${K8S_KUBECONFIG_FILE}" > "\${K8S_KUBECONFIG_FILE}.tmp" && mv "\${K8S_KUBECONFIG_FILE}.tmp" "\${K8S_KUBECONFIG_FILE}"
 chmod 600 "\${K8S_KUBECONFIG_FILE}"
-kubectl config set-context "\${K8S_CONTEXT}" --user "\${K8S_KUBECONFIG_USER}" --namespace "\${K8S_NAMESPACE}" --current
+kubectl config set-context "\${K8S_CONTEXT}" --user "\${K8S_KUBECONFIG_USER}" --namespace "\${K8S_NAMESPACE}"
 """
                 String active = sh(script: 'kubectl config current-context', returnStdout: true).trim()
                 if (active != context) {

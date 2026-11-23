@@ -3607,6 +3607,25 @@ test('injects the ServiceAccount token into a temporary kubeconfig without loggi
     assert !allEvidence.contains(fakeToken): 'the ServiceAccount token must never reach logs or artifacts'
 }
 
+test('keeps the named Kubernetes context without using --current in set-context') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                         stdout: 'cg-dev'])
+
+    h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                  registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                  images: images, deployments: names)
+
+    String setContext = h.sh.find { it.contains('kubectl config set-context') }
+    assert setContext != null: 'deployKubernetes must configure the temporary kubeconfig context'
+    assert setContext.contains('kubectl config set-context "${K8S_CONTEXT}"'): setContext
+    assert !setContext.contains('--current'): 'a context name and --current are mutually exclusive: ' + setContext
+}
+
 test('rejects a missing token credential before binding any credential') {
     def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42']])
     try {
