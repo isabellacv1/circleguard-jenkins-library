@@ -4786,6 +4786,9 @@ test('runs the pinned image against the deployed target with /zap/wrk mounted') 
     assert result.reports.collect { it.toString() }.contains(ZAP_HTML.toString()): result.reports
     assert h.publishedHtml.size() == 1
     assert h.publishedHtml[0].target.reportName == 'OWASP ZAP'
+    // Only the HTML report is published, never the workspace root (caches)
+    assert h.publishedHtml[0].target.reportDir == 'zap-html': h.publishedHtml
+    assert h.written.containsKey("zap-html/${ZAP_HTML}".toString()): h.written.keySet()
     assert h.junit == ['zap-summary-42.xml']
     assert h.unstable.isEmpty()
 }
@@ -5095,6 +5098,9 @@ test('merges JaCoCo, JUnit, Sonar, Trivy and ZAP into one Markdown + HTML report
     assert h.archived == ['quality-report-42.md,quality-report-42.html']: h.archived
     assert h.publishedHtml.size() == 1: h.publishedHtml
     assert h.publishedHtml[0].target.reportName == 'Coverage & Quality'
+    // Only the report is published, never the workspace root (caches)
+    assert h.publishedHtml[0].target.reportDir == 'quality-report-html': h.publishedHtml
+    assert h.written['quality-report-html/quality-report-42.html'] == html
     assert h.unstable.isEmpty(): 'an informational report never changes the result'
 }
 

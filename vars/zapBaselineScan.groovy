@@ -348,7 +348,14 @@ void archiveEvidence(List<String> names) {
 void publishHtmlEvidence(List<Map> plans) {
     List<String> html = plans.collect { it.html }.findAll { fileExists(it) }
     if (html) {
-        publishHTML(target: [reportDir               : '.',
+        // publishHTML copies the WHOLE reportDir into the build. With reportDir '.' that
+        // was the entire workspace (.trivy-cache, .terraform-plugin-cache: ~4.6 GB per
+        // build), so only the HTML reports are copied to their own directory first.
+        String reportDir = 'zap-html'
+        html.each { String name ->
+            writeFile file: "${reportDir}/${name}", text: readFile(name)
+        }
+        publishHTML(target: [reportDir               : reportDir,
                              reportFiles             : html.join(','),
                              reportName              : 'OWASP ZAP',
                              keepAll                 : true,

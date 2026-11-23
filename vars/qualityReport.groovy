@@ -86,7 +86,11 @@ def call(Map params = [:]) {
         writeFile file: mdFile, text: markdown
         writeFile file: htmlFile, text: html
         archiveArtifacts artifacts: "${mdFile},${htmlFile}", allowEmptyArchive: true
-        publishHTML(target: [reportDir               : '.',
+        // Only the report is published: with reportDir '.' publishHTML copied the whole
+        // workspace (caches included, ~4.6 GB) into every build.
+        String reportDir = 'quality-report-html'
+        writeFile file: "${reportDir}/${htmlFile}", text: html
+        publishHTML(target: [reportDir               : reportDir,
                              reportFiles             : htmlFile,
                              reportName              : 'Coverage & Quality',
                              keepAll                 : true,
