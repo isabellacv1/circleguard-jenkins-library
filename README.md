@@ -147,8 +147,8 @@ and deliberately has no `--context`/`--namespace`; every command that interacts
 with the cluster passes both flags explicitly. The rendered output is validated
 **before archiving and before the server dry-run or apply**: it must not be
 empty, every resource must have `metadata.namespace: circleguard`, and the only
-allowed kinds are `ConfigMap`, `Deployment`, `Service`, `Ingress` and
-`PersistentVolumeClaim`. Namespaces, RBAC, quotas, NetworkPolicies and
+allowed kinds are `ConfigMap`, `Deployment`, `Service`, `Ingress`,
+`PersistentVolumeClaim` and `HorizontalPodAutoscaler` (gateway autoscaling). Namespaces, RBAC, quotas, NetworkPolicies and
 observability belong to `infra/k8s/platform/overlays/<env>` and are applied by
 infrastructure, not by this library. The active context is checked after the
 local render but **before** the server dry-run and apply, so no cluster mutation

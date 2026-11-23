@@ -4003,11 +4003,48 @@ test('rejects an empty render') {
     assert h.sh.every { !it.contains(' apply -k ') }
 }
 
+test('applies a render that includes the gateway HorizontalPodAutoscaler') {
+    def names = ['circleguard-web', 'circleguard-auth-service', 'circleguard-identity-service',
+                 'circleguard-promotion-service', 'circleguard-notification-service',
+                 'circleguard-form-service', 'circleguard-gateway-service',
+                 'circleguard-dashboard-service', 'circleguard-file-service']
+    def images = names.collect { [name: it.replace('circleguard-', 'circleguard/')] }
+    String hpaManifest = VALID_K8S_MANIFEST + '''
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: circleguard-gateway-hpa
+  namespace: circleguard
+'''
+    def h = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                        stdout: 'cg-dev', renderedManifest: hpaManifest])
+    h.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                  registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                  images: images, deployments: names)
+    assert h.sh.any { it.contains(' apply -k ') }: 'the HPA render must be applied'
+
+    String otherNamespace = hpaManifest.replace('  name: circleguard-gateway-hpa\n  namespace: circleguard',
+                                                '  name: circleguard-gateway-hpa\n  namespace: kube-system')
+    def bad = newStep('deployKubernetes', [env: [IMAGE_VERSION: '1.0.0-dev.15', BUILD_NUMBER: '42'],
+                                          stdout: 'cg-dev', renderedManifest: otherNamespace])
+    try {
+        bad.script.call(environment: 'dev', context: 'cg-dev', namespace: 'circleguard',
+                        registry: '10.20.1.230:8082', overlayPath: 'infra/k8s/overlays/dev',
+                        images: images, deployments: names)
+        assert false: 'an HPA outside circleguard must be rejected'
+    } catch (RuntimeException e) {
+        assert e.message.contains("HorizontalPodAutoscaler/circleguard-gateway-hpa: namespace 'kube-system' is outside 'circleguard'"): e.message
+    }
+    assert bad.sh.every { !it.contains(' apply -k ') }
+}
+
 test('validates the rendered application scope in source') {
     String text = new File(root, 'vars/deployKubernetes.groovy').text
     assert text.indexOf('validateRenderedManifest(renderedManifest') > 0
     assert text.indexOf('validateRenderedManifest(renderedManifest') < text.indexOf('archiveArtifacts')
-    assert text.contains("'ConfigMap', 'Deployment', 'Service', 'Ingress', 'PersistentVolumeClaim'")
+    assert text.contains("'ConfigMap', 'Deployment', 'Service', 'Ingress', 'PersistentVolumeClaim',")
+    assert text.contains("'HorizontalPodAutoscaler']")
     assert !text.contains('--prune')
 }
 

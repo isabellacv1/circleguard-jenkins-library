@@ -254,7 +254,9 @@ static void validateRenderedManifest(String manifest, String environment, String
         throw new IllegalArgumentException(
             "deployKubernetes: render of ${overlayPath} is empty; refusing to apply an empty manifest")
     }
-    List<String> allowedKinds = ['ConfigMap', 'Deployment', 'Service', 'Ingress', 'PersistentVolumeClaim']
+    // HorizontalPodAutoscaler: the gateway autoscaling of HU-28 (components/hpa) is part of the application
+    List<String> allowedKinds = ['ConfigMap', 'Deployment', 'Service', 'Ingress', 'PersistentVolumeClaim',
+                                 'HorizontalPodAutoscaler']
     String appNamespace = 'circleguard'
     List<String> problems = []
     resources.eachWithIndex { Map<String, String> resource, int index ->
